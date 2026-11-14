@@ -382,6 +382,105 @@ static void check_romfs_index(const char *which) {
 }
 
 
+// Follow the virtual metadata as the guest does, rather than reading the original file offset.
+static void check_layered_image(const char *expected, int expected_files) {
+    Service *svc = open_romfs_storage();
+    Storage *state = svc->state;
+    uint64_t header[10];
+    assert(romfs_read(state->fd, (uint8_t *)header, sizeof header, 0) == sizeof header);
+    uint8_t meta[256];
+    assert(header[8] <= sizeof meta);
+    assert(romfs_read(state->fd, meta, header[8], header[7]) == (ssize_t)header[8]);
+    uint64_t at = 0;
+    int entries = 0, rules = 0, extras = 0;
+    while (at < header[8]) {
+        assert(header[8] - at >= 0x20);
+        uint32_t name_size;
+        uint64_t offset, size;
+        memcpy(&name_size, meta + at + 0x1c, 4);
+        memcpy(&offset, meta + at + 8, 8);
+        memcpy(&size, meta + at + 0x10, 8);
+        assert(name_size <= header[8] - at - 0x20);
+        char actual[16] = {0};
+        assert(size <= sizeof actual);
+        assert(romfs_read(state->fd, (uint8_t *)actual, size, header[9] + offset) == (ssize_t)size);
+        if (name_size == 4 && !memcmp(meta + at + 0x20, "rule", 4)) {
+            assert(size == strlen(expected) && !memcmp(actual, expected, size));
+            rules++;
+        } else {
+            assert(expected_files == 2 && name_size == 5 && !memcmp(meta + at + 0x20, "extra", 5));
+            assert(size == 5 && !memcmp(actual, "ADDED", 5));
+            extras++;
+        }
+        entries++;
+        at += 0x20 + ((name_size + 3) & ~3u);
+    }
+    assert(at == header[8] && entries == expected_files && rules == 1 && extras == expected_files - 1);
+    free(svc->state); free((char *)svc->name); free(svc);
+}
+
+// Online intent excludes real loose-file overlays, including capture with its relay disabled.
+static void check_romfs_layer_online_reset(void) {
+    char oldcwd[PATH_MAX], root[] = "/tmp/monzamac-layer-session.XXXXXX";
+    assert(getcwd(oldcwd, sizeof oldcwd) && mkdtemp(root) && !chdir(root));
+    uint8_t image[0xd4] = {0};
+    uint64_t header[10] = {0x50, 0x50, 4, 0x58, 0x40, 0x98, 4, 0xa0, 0x24, 0xd0};
+    memcpy(image, header, sizeof header);
+    uint32_t none = UINT32_MAX, zero = 0, name_size = 4;
+    for (int i = 1; i <= 4; i++) memcpy(image + 0x58 + i * 4, &none, 4);
+    memcpy(image + 0x58 + 0xc, &zero, 4);
+    memcpy(image + 0xa0 + 4, &none, 4);
+    memcpy(image + 0xa0 + 0x10, &(uint64_t){4}, 8);
+    memcpy(image + 0xa0 + 0x18, &none, 4);
+    memcpy(image + 0xa0 + 0x1c, &name_size, 4);
+    memcpy(image + 0xa0 + 0x20, "rule", 4);
+    memcpy(image + 0xd0, "BASE", 4);
+    int fd = open("image.bin", O_CREAT | O_EXCL | O_WRONLY, 0600);
+    assert(fd >= 0 && write(fd, image, sizeof image) == sizeof image && !close(fd));
+    assert(!mkdir("mods", 0700) && !mkdir("mods/demo", 0700) && !mkdir("mods/demo/romfs", 0700));
+    fd = open("mods/demo/romfs/rule", O_CREAT | O_EXCL | O_WRONLY, 0600);
+    assert(fd >= 0 && write(fd, "MODIFIED", 8) == 8 && !close(fd));
+    fd = open("mods/demo/romfs/extra", O_CREAT | O_EXCL | O_WRONLY, 0600);
+    assert(fd >= 0 && write(fd, "ADDED", 5) == 5 && !close(fd));
+    g_romfs_dir = "image";
+    assert(!unsetenv("LUMIOSE_TEST_MODULE"));
+    fs_reset(); layer_reset();
+    check_layered_image("MODIFIED", 2);
+    assert(nlayers == 1 && ov_n > 0);
+
+    assert(!setenv("LUMIOSE_TEST_MODULE", "synthetic-module", 1));
+    assert(!setenv("LUMIOSE_TEST_NETWORK", "0", 1));
+    assert(!setenv("LUMIOSE_TEST_CAPTURE_ONLY", "1", 1));
+    fs_reset(); layer_reset();
+    assert(romfs_fd == -1 && !rom_files && !ov_n && !npatches);
+    check_layered_image("BASE", 1);
+    assert(nlayers == 0 && !ov_n && !npatches);
+
+    // Presence is fail-closed even if the module path is not yet populated.
+    assert(!setenv("LUMIOSE_TEST_MODULE", "", 1));
+    fs_reset(); layer_reset();
+    check_layered_image("BASE", 1);
+    assert(nlayers == 0 && !ov_n && !npatches);
+
+    assert(!unsetenv("LUMIOSE_TEST_MODULE"));
+    assert(!unsetenv("LUMIOSE_TEST_NETWORK"));
+    assert(!unsetenv("LUMIOSE_TEST_CAPTURE_ONLY"));
+    fs_reset(); layer_reset();
+    check_layered_image("MODIFIED", 2);
+    assert(nlayers == 1 && ov_n > 0);
+    fs_reset(); layer_reset(); g_romfs_dir = ".";
+
+    uint8_t unchanged[sizeof image];
+    fd = open("image.bin", O_RDONLY);
+    assert(fd >= 0 && pread(fd, unchanged, sizeof unchanged, 0) == sizeof unchanged && !close(fd));
+    assert(!memcmp(unchanged, image, sizeof image));
+    fd = open("mods/demo/romfs/rule", O_RDONLY);
+    assert(fd >= 0); check_bytes(fd, "MODIFIED", 8); assert(!close(fd));
+    assert(!chdir(oldcwd)); remove_tree(root);
+    puts("PASS romfs-layer-online-reset");
+}
+
+
 // The data.trpfd FlatBuffer can be malformed; the game must keep its original rather than indexing out of bounds.
 static void check_trpfd(const char *which) {
     char oldcwd[PATH_MAX], root[] = "/tmp/monzamac-trpfd.XXXXXX";
@@ -436,6 +535,7 @@ static void check_trpfd(const char *which) {
 int main(int argc, char **argv) {
     assert(argc == 2);
     if (!strncmp(argv[1], "trpfd-", 6)) { check_trpfd(argv[1]); return 0; }
+    if (!strcmp(argv[1], "romfs-layer-online-reset")) { check_romfs_layer_online_reset(); return 0; }
     if (!strncmp(argv[1], "romfs-index-", 12)) { check_romfs_index(argv[1]); return 0; }
     if (!strncmp(argv[1], "romfs-patch-", 12)) { check_romfs_patch(argv[1]); return 0; }
     if (!strcmp(argv[1], "route-mounts")) { check_route_mounts(); return 0; }
