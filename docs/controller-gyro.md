@@ -55,9 +55,11 @@ a live mode change is incomplete; selecting the mode in the launcher before Cont
 
 For an [Inkay evolution test](https://www.gamesradar.com/games/pokemon/pokemon-legends-z-a-inkay-evolve-malamar/),
 use **Handheld** mode with an Inkay at level 30 or higher in the party, and check **Always provide controller motion**.
-Hold the controller upside down while
-opening Inkay's party-menu actions and select **Evolve**. Camera gyro can be disabled for this. The native motion
-and handheld paths have synthetic regressions; the actual evolution still needs a physical-controller playtest.
+On a DualSense, hold it vertically with the face buttons toward you, the USB/shoulder-button edge pointing toward
+the floor and both grips pointing up. Keep that pose while selecting Inkay to open its party-menu actions, then
+select **Evolve**. If its action menu was already open, back out and select Inkay again while keeping the pose.
+The Evolve option was confirmed in a physical DualSense playtest with **Enable gyro camera** unchecked and
+**Always provide controller motion** checked.
 
 The adapter follows the public [libnx state layout and sensor handles](https://github.com/switchbrew/libnx/blob/master/nx/include/switch/services/hid.h),
 converting SDL units and axes into native acceleration in G and rotation in revolutions.
