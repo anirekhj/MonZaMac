@@ -41,6 +41,11 @@ inversion and recalibration. Ordinary MonZaMac Controls overlays do not reset it
 minimized windows, preparation/launcher pages, scripted input, disconnected devices and stale reports suppress native
 readings. Sensor channels are enabled only while either the camera or native game input needs them.
 
+Direct SDK sensor starts and HID service commands 66/67 share the same activation state. Starting an already
+active handle is idempotent, and stopping one handle keeps sensing enabled while another handle needs it.
+Enumerating handles or reading states does not start a sensor. The `motion` diagnostic identifies the activation
+source as `hle` or `ipc` so a physical-controller run can confirm which route the game uses.
+
 The virtual controller matches **Video → Game mode**: Docked uses player 1 / FullKey; Handheld uses the handheld
 controller ID and style. A dock/undock also signals controller-style watchers. Restart the game if its response to
 a live mode change is incomplete; selecting the mode in the launcher before Continue avoids that dependency.

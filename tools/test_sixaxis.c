@@ -5,10 +5,12 @@
 #include <stdio.h>
 #include <string.h>
 #include "../runtime/hle/sixaxis.c"
+#include "../runtime/services/hid_set.c"
 
 uint64_t g_alias_base, g_alias_size;
 static bool handheld, available, demand, log_enabled;
 static unsigned demand_calls, sample_reads, diagnostic_lines;
+static char diagnostic_text[512];
 static uint64_t clock_ns = 1000000000ull;
 static InputMotionSnapshot physical;
 static struct {
@@ -30,10 +32,22 @@ bool input_motion_snapshot(InputMotionSnapshot *out) {
 }
 bool devlog_on(const char *subject) { assert(!strcmp(subject, "motion")); return log_enabled; }
 void devlog(const char *subject, const char *fmt, ...) {
-    (void)fmt;
     assert(!strcmp(subject, "motion"));
-    if (log_enabled) ++diagnostic_lines;
+    if (log_enabled) {
+        ++diagnostic_lines;
+        va_list args; va_start(args, fmt); vsnprintf(diagnostic_text, sizeof diagnostic_text, fmt, args); va_end(args);
+    }
 }
+// Unrelated HID/settings service dependencies are never used by these scenarios.
+KEvent *kernel_create_event_pair(uint32_t *w, uint32_t *r) { (void)w; (void)r; assert(!"unexpected event request"); return NULL; }
+KSharedMem *kernel_create_shared_memory(uint64_t size, void (*map)(KSharedMem *), uint32_t *h) {
+    (void)size; (void)map; (void)h; assert(!"unexpected shared memory request"); return NULL;
+}
+Service *service_new(const char *name, ServiceHandler handler, void *state) {
+    (void)name; (void)handler; (void)state; assert(!"unexpected service creation"); return NULL;
+}
+void ipc_return_object(IpcResp *resp, Service *service) { (void)resp; (void)service; assert(!"unexpected object return"); }
+const char *settings_language(void) { return "en-US"; }
 static uint64_t ptr(const void *p) { return (uintptr_t)p; }
 static void closef(float a, float b) { assert(fabsf(a - b) < 0.00001f); }
 static void start(uint32_t *h) { Cpu c = {0}; c.x[0] = ptr(h); six_start(&c); }
@@ -157,6 +171,51 @@ static void test_controls(void) {
     six_reset(); c.x[0] = ptr(&arena.fullkey); six_fusion_enabled(&c); assert(c.x[0] == 1);
     c.x[0] = ptr(&arena.fullkey); six_get_drift(&c); assert(c.x[0] == 1);
 }
+static uint32_t ipc_motion_control(uint32_t command, uint32_t handle, uint32_t bytes) {
+    // Deliberately unaligned payload: the service must decode the handle safely.
+    uint8_t payload[17] = {0}; memcpy(payload + 1, &handle, sizeof handle);
+    IpcReq request = {.cmd = command, .data = payload + 1, .data_size = bytes};
+    IpcResp response = {0}; hid(NULL, &request, &response); return response.result;
+}
+static void test_ipc_activation(void) {
+    handheld = true;
+    assert(handles(0x20, 2, 1) == 1 && !demand);
+    assert(states(&arena.handheld, 1) == 0 && !demand); // enumeration/reads never start sensing
+    for (unsigned bytes = 0; bytes < 16; bytes++) {
+        assert(ipc_motion_control(66, SIX_HANDHELD, bytes) != 0);
+        assert(!demand && demand_calls == 0);
+    }
+    log_enabled = true;
+    assert(ipc_motion_control(66, SIX_HANDHELD, 16) == 0 && demand && demand_calls == 1);
+    assert(strstr(diagnostic_text, "origin=ipc"));
+    assert(states(&arena.handheld, 1) == 1 && arena.states[0].sampling_number == 42);
+    closef(arena.states[0].acceleration[2], -1);
+    physical.sampling_number++;
+    physical.acceleration[1] = -9.80665f;
+    physical.direction[4] = physical.direction[8] = -1;
+    assert(states(&arena.handheld, 1) == 1 && arena.states[0].sampling_number == 43);
+    closef(arena.states[0].acceleration[2], 1); closef(arena.states[0].direction[8], -1);
+    start(&arena.handheld); assert(demand_calls == 1 && strstr(diagnostic_text, "origin=hle"));
+    assert(ipc_motion_control(66, SIX_HANDHELD, 16) == 0 && demand_calls == 1);
+    for (unsigned bytes = 0; bytes < 16; bytes++) {
+        assert(ipc_motion_control(67, SIX_HANDHELD, bytes) != 0);
+        assert(demand && demand_calls == 1 && states(&arena.handheld, 1) == 1);
+    }
+    assert(ipc_motion_control(66, 0xffffffff, 16) != 0);
+    assert(ipc_motion_control(67, 0xffffffff, 16) != 0);
+    IpcReq null_request = {.cmd = 67, .data_size = 16}; IpcResp null_response = {0};
+    hid(NULL, &null_request, &null_response);
+    assert(null_response.result != 0 && demand && demand_calls == 1);
+    start(&arena.fullkey); assert(demand_calls == 2);
+    assert(ipc_motion_control(67, SIX_HANDHELD, 16) == 0 && demand && demand_calls == 3);
+    assert(states(&arena.handheld, 1) == 0);
+    handheld = false; assert(states(&arena.fullkey, 1) == 1);
+    stop(&arena.fullkey); assert(!demand && demand_calls == 4);
+    assert(ipc_motion_control(67, SIX_FULLKEY, 16) == 0 && !demand && demand_calls == 4);
+    assert(ipc_motion_control(66, SIX_FULLKEY, 16) == 0 && demand);
+    six_reset(); hid_reset();
+    assert(!demand && states(&arena.fullkey, 1) == 0);
+}
 static void *toggle(void *p) { for (int i = 0; i < 10000; ++i) { start(p); stop(p); } return NULL; }
 static void test_parallel(void) {
     pthread_t a, b;
@@ -177,6 +236,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "axes")) test_axes();
     else if (!strcmp(argv[1], "controls")) test_controls();
     else if (!strcmp(argv[1], "parallel")) test_parallel();
+    else if (!strcmp(argv[1], "ipc")) test_ipc_activation();
     else assert(!"unknown scenario");
     puts("PASS 1 SixAxis scenario");
     return 0;

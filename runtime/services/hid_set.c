@@ -4,6 +4,8 @@
 #include "../hle.h"
 #include "../ipc.h"
 #include "../settings.h"
+#include "../sixaxis.h"
+#include "../devlog.h"
 
 static uint32_t new_event_handle(void) {
     uint32_t w, r;
@@ -29,6 +31,16 @@ SERVICE("hid", hid) {
     switch (req->cmd) {
     case 0: ipc_return_object(resp, service_new("IAppletResource", applet_resource, NULL)); break;
     case 40: case 106: resp->copy_handles[resp->ncopy++] = new_event_handle(); break;
+    case 66: case 67: {  // Start/StopSixAxisSensor: handle u32, padding u32, applet-resource id u64.
+        if (!req->data || req->data_size < 16) {
+            devlog("motion", "SixAxis %s origin=ipc rejected=short-payload bytes=%u", req->cmd == 66 ? "start" : "stop", req->data_size);
+            resp->result = MAKE_RESULT(202, 107); break;  // HID: invalid SixAxis sensor handle
+        }
+        uint32_t handle;
+        memcpy(&handle, req->data, sizeof handle);
+        if (!sixaxis_set_started(handle, req->cmd == 66, SIXAXIS_ORIGIN_IPC)) resp->result = MAKE_RESULT(202, 107);
+        break;
+    }
     case 101: OUT(uint32_t, 0) = 0x1F; resp_size(resp, 4); break;  // GetSupportedNpadStyleSet
     case 121: OUT(int64_t, 0) = 0; resp_size(resp, 8); break;      // GetNpadJoyHoldType
     case 129: OUT(int64_t, 0) = 0; resp_size(resp, 8); break;      // GetNpadHandheldActivationMode

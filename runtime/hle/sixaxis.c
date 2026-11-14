@@ -6,6 +6,7 @@
 #include "../hle.h"
 #include "../devlog.h"
 #include "../motion_input.h"
+#include "../sixaxis.h"
 #include "../services/am.h"
 
 // Public ABI and handle packing: switchbrew/libnx, services/hid.h and services/hid.c.
@@ -137,17 +138,28 @@ HLE_FUNC("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_
     devlog("motion", "SixAxis handles mode=%s id=%#x styles=%#x count=%u handle=%#x",
            handheld ? "handheld" : "docked", id, style, valid ? 1 : 0, valid ? handle : 0);
 }
-static void six_set_started(Cpu *c, bool started) {
-    int slot = six_arg_slot(c->x[0]);
-    if (slot < 0) return;
+bool sixaxis_set_started(uint32_t handle, bool started, SixAxisOrigin origin) {
+    int slot = six_slot(handle);
+    const char *source = origin == SIXAXIS_ORIGIN_IPC ? "ipc" : "hle";
+    if (slot < 0) {
+        devlog("motion", "SixAxis %s origin=%s handle=%#x rejected=invalid-handle", started ? "start" : "stop", source, handle);
+        return false;
+    }
     pthread_mutex_lock(&six_lock);
-    if (six_controls[slot].started != started) {
+    bool changed = six_controls[slot].started != started;
+    if (changed) {
         six_controls[slot].started = started;
         six_demand();
-        devlog("motion", "SixAxis %s slot=%d native-demand=%d", started ? "start" : "stop", slot,
-               six_controls[0].started || six_controls[1].started);
     }
+    devlog("motion", "SixAxis %s origin=%s handle=%#x slot=%d changed=%d native-demand=%d", started ? "start" : "stop", source,
+           handle, slot, changed, six_controls[0].started || six_controls[1].started);
     pthread_mutex_unlock(&six_lock);
+    return true;
+}
+static void six_set_started(Cpu *c, bool started) {
+    uint32_t handle;
+    if (six_read_u32(c->x[0], &handle)) sixaxis_set_started(handle, started, SIXAXIS_ORIGIN_HLE);
+    else devlog("motion", "SixAxis %s origin=hle rejected=invalid-handle-pointer", started ? "start" : "stop");
 }
 HLE_FUNC("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", six_start) { six_set_started(c, true); }
 HLE_FUNC("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", six_stop) { six_set_started(c, false); }

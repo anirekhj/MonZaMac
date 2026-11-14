@@ -37,6 +37,7 @@ class SixAxisTests(unittest.TestCase):
     def test_units_axes_matrix_and_upside_down(self): self.check_scenario("axes")
     def test_fusion_and_drift_preferences_roundtrip(self): self.check_scenario("controls")
     def test_parallel_handles_and_bounded_diagnostics(self): self.check_scenario("parallel")
+    def test_hid_ipc_activation_shared_with_sdk_imports(self): self.check_scenario("ipc")
 
 
 if __name__ == "__main__":
