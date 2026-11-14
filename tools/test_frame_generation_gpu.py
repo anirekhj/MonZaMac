@@ -12,6 +12,7 @@ with tempfile.TemporaryDirectory(prefix="monzamac-fg-") as tmp:
         "xcrun", "clang", "-std=gnu11", "-fobjc-arc", "-Wall", "-Wextra", "-Werror",
         "-mmacosx-version-min=15.0", "-I", str(root / "runtime/nvn"),
         str(root / "tools/test_frame_generation_gpu.m"),
+        str(root / "runtime/nvn/frame_generation_camera.c"),
         "-framework", "Foundation", "-framework", "Metal", "-framework", "MetalFX",
         "-o", str(binary),
     ], check=True)

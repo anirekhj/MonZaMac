@@ -6,6 +6,7 @@
 #include <math.h>
 #include <stdio.h>
 #include "frame_generation.h"
+#include "frame_generation_camera.h"
 // Include the implementation to inspect GPU motion/depth without test-only public API.
 #include "../runtime/nvn/frame_generation.m"
 
@@ -27,6 +28,37 @@ static FgCamera camera_xy(float camera_x, float camera_y, bool reversed) {
     return c;
 }
 static FgCamera camera(float x, bool reversed) { return camera_xy(x,0,reversed); }
+// Independently invert float matrices in double precision, as in the camera
+// decoder fixtures. Large translations expose cancellation in a float VP*inv.
+static matrix_float4x4 precise_inverse(matrix_float4x4 m) {
+    matrix_double4x4 d;
+    for(unsigned col=0;col<4;col++)for(unsigned row=0;row<4;row++)d.columns[col][row]=m.columns[col][row];
+    d=simd_inverse(d);
+    for(unsigned col=0;col<4;col++)for(unsigned row=0;row<4;row++)m.columns[col][row]=(float)d.columns[col][row];
+    return m;
+}
+static FgCamera large_world_camera(bool reversed) {
+    float t=reversed?35000:40000,n=.1f,f=6000.f,ys=1.f/tanf(40.f*M_PI/360.f),xs=ys/((float)W/H);
+    float co=cosf(.7f),si=sinf(.7f);
+    matrix_float4x4 p={.columns={{xs,0,0,0},{0,ys,0,0},{0,0,reversed?n/(f-n):f/(n-f),-1},
+        {0,0,reversed?n*f/(f-n):n*f/(n-f),0}}};
+    matrix_float4x4 v={.columns={{co,0,-si,0},{0,1,0,0},{si,0,co,0},{t,-t*.4f,t*.8f,1}}};
+    matrix_float4x4 vp=simd_mul(p,v),inv=precise_inverse(vp),iv=precise_inverse(v),ip=precise_inverse(p);
+    float binding[96];
+    memcpy(binding,&vp,64);memcpy(binding+16,&v,64);memcpy(binding+32,&p,64);
+    memcpy(binding+48,&inv,64);memcpy(binding+64,&iv,64);memcpy(binding+80,&ip,64);
+    FgCamera c;assert(fg_camera_decode(binding,sizeof binding,&c));
+    // Both fixtures passed decoding but were rejected by the old absolute .02 gate.
+    matrix_float4x4 product=simd_mul(vp,inv);float old_error=0;
+    for(unsigned col=0;col<4;col++)for(unsigned row=0;row<4;row++)
+        old_error=fmaxf(old_error,fabsf(product.columns[col][row]-(col==row?1.f:0.f)));
+    assert(old_error>.02f);
+    assert(camera_valid(&c));
+    FgCamera invalid=c;invalid.inverse_view_projection[0]+=1;assert(!camera_valid(&invalid));
+    invalid=c;memset(invalid.inverse_view_projection,0,sizeof invalid.inverse_view_projection);assert(!camera_valid(&invalid));
+    invalid=c;invalid.inverse_view_projection[10]=NAN;assert(!camera_valid(&invalid));
+    return c;
+}
 static id<MTLTexture> scene(int shift, bool ui) {
     MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:W height:H mipmapped:NO];
     d.usage=MTLTextureUsageShaderRead;
@@ -171,6 +203,26 @@ static id<MTLTexture> geometry_field(bool gradient) {
     free(pixels);return t;
 }
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+API_AVAILABLE(macos(26.0))
+static void large_world_camera_test(int mode) {
+    for(int reversed=0;reversed<2;reversed++) {
+        fg_reset();assert(!strcmp(fg_last_status(),"reset"));
+        FgCamera c=large_world_camera(reversed);
+        id<MTLTexture> source=scene(0,false),z=depth(reversed,false);
+        double dt=1./(mode==1?30:60);
+        for(unsigned i=0;i<6;i++) {
+            id<MTLTexture> out=encode(source,nil,z,&c,mode,90.+i*dt);
+            if(i<2)assert(!out);else assert(out);
+            assert(!strcmp(fg_last_status(),i==0?"reset-no-history":i==1?"warmup":"ready"));
+            assert(state && !camera_cut(&c,&c));
+        }
+        FgCamera invalid=c;invalid.inverse_view_projection[0]+=1;
+        assert(!encode(source,nil,z,&invalid,mode,90.+6*dt));
+        assert(!state && !strcmp(fg_last_status(),"invalid-camera"));
+        assert(!encode(nil,nil,z,&c,mode,90.+7*dt));
+        assert(!strcmp(fg_last_status(),"invalid-input"));
+    }
+}
 API_AVAILABLE(macos(26.0))
 static void geometry_motion_test(int mode) {
     fg_reset();double now=20,dt=1./(mode==1?30:60);
@@ -353,6 +405,7 @@ int main(void) {@autoreleasepool {
     unsetenv("LARECOMP_FG_OUTPUT_FP16");
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if(@available(macOS 26.0,*)) {
+    large_world_camera_test(1);large_world_camera_test(2);
     geometry_motion_test(1);geometry_motion_test(2);
     pooled_output_test(1);pooled_output_test(2);
     pooled_output_recovery_test(1);pooled_output_recovery_test(2);
@@ -515,7 +568,7 @@ int main(void) {@autoreleasepool {
         }
         fg_reset();
     }
-    puts("PASS: both modes, normal/reversed native/float depth, motion scenes, 4px X/-3px Y backward motion, geometry override/sentinel/nonfinite fallback/scaling, interior midpoint within 1px, private output distinct from endpoints, reset/gap/nil/off/UI/cut/resize, immutable outputs, bounded completion-safe output reuse, in-flight retention");
+    puts("PASS: both modes, normal/reversed native/float depth, motion scenes, 4px X/-3px Y backward motion, geometry override/sentinel/nonfinite fallback/scaling, interior midpoint within 1px, private output distinct from endpoints, large-world camera precision/status, corrupt inverse rejection, reset/gap/nil/off/UI/cut/resize, immutable outputs, bounded completion-safe output reuse, in-flight retention");
     }
 #endif
     return 0;

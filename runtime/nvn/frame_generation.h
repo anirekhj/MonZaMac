@@ -27,6 +27,8 @@ bool fg_supported(void);
 // Developer-only, call after committing the encoded frame and before encoding another.
 bool fg_debug_dump(const char *directory);
 void fg_reset(void);
+// Latest encode/reset result as a process-lifetime literal; synchronized, with no logging.
+const char *fg_last_status(void);
 #ifdef __OBJC__
 // End active encoders first. Calls and commits must follow frame order on one queue.
 // Inputs must be shader-readable, tracked, single-sample 2D textures of equal size.

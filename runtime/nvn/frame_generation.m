@@ -53,6 +53,7 @@ API_AVAILABLE(macos(26.0))
 @end
 
 static FgState *state API_AVAILABLE(macos(26.0));
+static const char *last_status = "not-encoded";  // guarded by the same lock as state
 
 // MetalFX expects backward motion in pixels. Reconstruct using the same raw
 // [0,1] depth as the supplied inverse VP; reversed Z needs no extra inversion.
@@ -100,11 +101,18 @@ static BOOL camera_valid(const FgCamera *c) {
     if(!c || !isfinite(c->near_plane) || !isfinite(c->far_plane) || c->near_plane<=0 || c->far_plane<=c->near_plane ||
        !isfinite(c->vertical_fov) || c->vertical_fov<=0 || c->vertical_fov>=180 || !isfinite(c->aspect) || c->aspect<=0)return NO;
     for(unsigned i=0;i<16;i++)if(!isfinite(c->view_projection[i]) || !isfinite(c->inverse_view_projection[i]))return NO;
-    matrix_float4x4 vp, inv;
-    memcpy(&vp,c->view_projection,sizeof vp); memcpy(&inv,c->inverse_view_projection,sizeof inv);
-    matrix_float4x4 product=simd_mul(vp,inv);
-    for(unsigned col=0;col<4;col++)for(unsigned row=0;row<4;row++)
-        if(!isfinite(product.columns[col][row]) || fabsf(product.columns[col][row]-(col==row?1.f:0.f))>.02f)return NO;
+    // Match the scene camera decoder: large world translations cancel in
+    // VP * inverse VP, so a float product with an absolute limit rejects valid
+    // cameras at some positions. Keep the decoder's double, magnitude-relative
+    // check rather than widening the allowed error for small/corrupt matrices.
+    for(unsigned col=0;col<4;col++)for(unsigned row=0;row<4;row++) {
+        double value=0,magnitude=0;
+        for(unsigned k=0;k<4;k++) {
+            double term=(double)c->view_projection[k*4+row]*c->inverse_view_projection[col*4+k];
+            value+=term;magnitude+=fabs(term);
+        }
+        if(fabs(value-(double)(col==row))>0.00005+0.000001*magnitude)return NO;
+    }
     return YES;
 }
 static BOOL camera_cut(const FgCamera *old, const FgCamera *c) {
@@ -216,9 +224,16 @@ void fg_reset(void) {
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if(@available(macOS 26.0,*)) @synchronized([FgState class]) {
         // Pending completion handlers retain the old generation and its resources.
-        state=nil;
+        state=nil;last_status="reset";
     }
 #endif
+}
+
+const char *fg_last_status(void) {
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if(@available(macOS 26.0,*)) @synchronized([FgState class]) { return last_status; }
+#endif
+    return "unsupported";
 }
 
 static BOOL rect_fits(const FgRect *r, id<MTLTexture> t) {
@@ -230,7 +245,8 @@ static id<MTLTexture> fg_encode_internal(id<MTLCommandBuffer> cb, id<MTLTexture>
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if(@available(macOS 26.0,*)) @synchronized([FgState class]) {
         id<MTLDevice> device=cb.device;
-        BOOL valid=cb && cb.status<MTLCommandBufferStatusCommitted && (mode==1 || mode==2) && isfinite(now) && camera_valid(camera) &&
+        BOOL valid_camera=camera_valid(camera);
+        BOOL valid=cb && cb.status<MTLCommandBufferStatusCommitted && (mode==1 || mode==2) && isfinite(now) && valid_camera &&
             [MTLFXFrameInterpolatorDescriptor supportsDevice:device] &&
             usable(scene,device,scene.width,scene.height) && color_format(scene.pixelFormat) &&
             usable(depth,device,depth.width,depth.height) && rect_fits(depth_rect,depth) &&
@@ -243,26 +259,30 @@ static id<MTLTexture> fg_encode_internal(id<MTLCommandBuffer> cb, id<MTLTexture>
             usable(prepared->motion,device,depth.width,depth.height) && prepared->motion.pixelFormat==MTLPixelFormatRG16Float &&
             depth.width<=scene.width && depth.height<=scene.height &&
             isfinite(prepared->jitter[0]) && isfinite(prepared->jitter[1]);
-        if(!valid) { state=nil; return nil; }
+        if(!valid) { state=nil;last_status=valid_camera?"invalid-input":"invalid-camera";return nil; }
         FgState *s=state;
         if(!s || s->queue!=cb.commandQueue || s->source_width!=scene.width || s->source_height!=scene.height || s->width!=working_width(scene.width,max_width) ||
            s->mode!=mode || s->scene_format!=scene.pixelFormat || s->depth_format!=depth.pixelFormat ||
            s->has_ui!=(ui!=nil) || s->ui_format!=ui.pixelFormat || s->prepared!=(prepared!=NULL) ||
            (prepared && (s->scaler!=prepared->scaler || s->input_width!=depth.width || s->input_height!=depth.height))) {
             state=s=make_state(cb,scene,ui,depth,mode,max_width,prepared);
-            if(!s)return nil;
+            if(!s){last_status="init-failed";return nil;}
         }
         double delta=now-s->time;
-        BOOL reset=!s->previous || !isfinite(delta) || delta<=0 || delta>.25 || camera_cut(&s->camera,camera) || (prepared && prepared->reset);
+        const char *reset_reason=!s->previous?"reset-no-history":
+            !isfinite(delta) || delta<=0 || delta>.25?"reset-time-gap":
+            camera_cut(&s->camera,camera)?"reset-camera-cut":
+            prepared && prepared->reset?"reset-prepared":NULL;
+        BOOL reset=reset_reason!=NULL;
         FgOutput *slot=reuse_output?acquire_output(s):nil;
         // Motion describes consecutive real frames. After a skipped interpolation,
         // old color no longer matches the next frame's motion, so reseed history.
-        if(reuse_output && !slot){s->previous=nil;return nil;}
+        if(reuse_output && !slot){s->previous=nil;last_status="output-busy";return nil;}
         id<MTLTexture> output=slot?slot->texture:texture(s,s->effect.outputTextureFormat,s->effect.outputTextureUsage|MTLTextureUsageShaderRead);
         FgFrame *frame=output?acquire_frame(s):nil, *previous=reset?nil:s->previous;
-        if(!frame || !output) { if(slot)slot->busy=NO;state=nil;return nil; }
+        if(!frame || !output) { if(slot)slot->busy=NO;state=nil;last_status="allocation-failed";return nil; }
         id<MTLComputeCommandEncoder> encoder=[cb computeCommandEncoder];
-        if(!encoder) { if(slot)slot->busy=NO;state=nil;return nil; }
+        if(!encoder) { if(slot)slot->busy=NO;state=nil;last_status="encoder-failed";return nil; }
         encoder.label=@"Frame generation input conversion and camera motion";
         [encoder setComputePipelineState:s->copy_color];
         uint32_t scene_rect[4]={0,0,(uint32_t)scene.width,(uint32_t)scene.height};
@@ -321,13 +341,14 @@ static id<MTLTexture> fg_encode_internal(id<MTLCommandBuffer> cb, id<MTLTexture>
             @synchronized([FgState class]) {
                 frame->readers--; if(previous)previous->readers--;
                 if(slot)slot->busy=NO;
-                if(completed.status==MTLCommandBufferStatusError && state==s)state=nil;
+                if(completed.status==MTLCommandBufferStatusError && state==s){state=nil;last_status="gpu-error";}
             }
         }];
         // The native effect copies current color on its first non-reset encode.
         // Suppress both seed frames so callers never count that copy as generated.
         BOOL ready=s->warmup==0;
         if(s->warmup)s->warmup--;
+        last_status=ready?"ready":reset_reason?reset_reason:"warmup";
         return ready?output:nil;
     }
 #endif
@@ -340,7 +361,7 @@ id<MTLTexture> fg_encode_view(id<MTLCommandBuffer> cb,id<MTLTexture> scene,id<MT
 }
 id<MTLTexture> fg_encode_prepared(id<MTLCommandBuffer> cb,id<MTLTexture> scene,id<MTLTexture> ui,
     const FgPreparedInputs *inputs,const FgCamera *camera,int mode,double now) {
-    if(!inputs){fg_reset();return nil;}
+    if(!inputs)return fg_encode_internal(cb,scene,ui,NULL,nil,NULL,nil,camera,mode,0,now,NULL,false);
     return fg_encode_internal(cb,scene,ui,NULL,inputs->depth,NULL,nil,camera,mode,0,now,inputs,false);
 }
 id<MTLTexture> fg_encode_view_reusing_output(id<MTLCommandBuffer> cb,id<MTLTexture> scene,id<MTLTexture> ui,const FgRect *ui_rect,
@@ -349,7 +370,7 @@ id<MTLTexture> fg_encode_view_reusing_output(id<MTLCommandBuffer> cb,id<MTLTextu
 }
 id<MTLTexture> fg_encode_prepared_reusing_output(id<MTLCommandBuffer> cb,id<MTLTexture> scene,id<MTLTexture> ui,
     const FgPreparedInputs *inputs,const FgCamera *camera,int mode,double now) {
-    if(!inputs){fg_reset();return nil;}
+    if(!inputs)return fg_encode_internal(cb,scene,ui,NULL,nil,NULL,nil,camera,mode,0,now,NULL,true);
     return fg_encode_internal(cb,scene,ui,NULL,inputs->depth,NULL,nil,camera,mode,0,now,inputs,true);
 }
 id<MTLTexture> fg_encode(id<MTLCommandBuffer> cb, id<MTLTexture> scene, id<MTLTexture> ui,

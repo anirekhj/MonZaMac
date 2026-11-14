@@ -1382,7 +1382,7 @@ void backend_present(NvnTexture *t) {
             }
         }
         if(g_settings.frame_generation && frame%120==0 && devlog_on("framegen"))
-            devlog("framegen","frame %llu mode %d screen %d visible %d menu %d inputs %d generated %d scene_format %lu ui_format %lu",(unsigned long long)frame,fg_mode,screen_hz,fg_display,menu_is_open(),fg_source!=nil,fg_window_image!=nil,(unsigned long)fg_source.pixelFormat,(unsigned long)(b?raw_view(b->tex).pixelFormat:0));
+            devlog("framegen","frame %llu mode %d screen %d display %d visible %d menu %d inputs %d generated %d status %s scene_format %lu ui_format %lu",(unsigned long long)frame,fg_mode,screen_hz,fg_display,atomic_load_explicit(&fg_window_visible,memory_order_relaxed),menu_is_open(),fg_source!=nil,fg_window_image!=nil,fg_last_status(),(unsigned long)fg_source.pixelFormat,(unsigned long)(b?raw_view(b->tex).pixelFormat:0));
 
         static long win_shot = -1;  // LARECOMP_WINDOW_SHOT=<frame>: save the final window image (game + menu)
         if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;

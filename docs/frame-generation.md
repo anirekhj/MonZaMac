@@ -34,9 +34,13 @@ Generation resets on mode, window size, input-size or projection changes, camera
 the native settings menu. After a reset the first two images seed history; they are shown as real frames rather than
 counting MetalFX's initial endpoint copy as a generated image. An independent presenter receives immutable GPU-ready
 images, uses a separate Metal queue, and limits pending whole-frame pairs to avoid an unbounded latency backlog.
+Camera inverse validation uses the scene decoder's double-precision, magnitude-relative check. This avoids rejecting
+valid cameras when large world-coordinate terms cancel; an absolute float-product threshold could suppress generation
+at particular positions even though scene decoding succeeded.
 
 The FPS overlay shows the real rate and actual display rate on one line, for example `60fps -> FG 120fps`.
-The FG suffix appears only while synthetic images are reaching the display. Without generation it shows only the real rate. `LARECOMP_DEVLOG=framegen` enables bounded input/generation diagnostics; presentation
+The FG suffix appears only while synthetic images are reaching the display. Without generation it shows only the real rate. `LARECOMP_DEVLOG=framegen` enables bounded input/generation diagnostics, including the latest encode/reset
+status (invalid camera or inputs, history warmup/cuts, resource pressure, initialization or GPU failure); presentation
 summaries also report dropped pending pairs. Counters alone do not establish visual interpolation quality.
 
 ## Verification
@@ -46,7 +50,8 @@ summaries also report dropped pending pairs. Counters alone do not establish vis
 - `python3 tools/test_frame_generation_camera.py`: synthetic normal/reversed projections, rotated cameras translated
   25 km, inconsistent matrices, malformed/unaligned inputs and rejection without modifying outputs.
 - `python3 tools/test_frame_generation_gpu.py`: native MetalFX with API/GPU validation, backward motion and depth
-  conversion, generated images distinct from both endpoints, HUD, resets, resize and in-flight resource retention.
+  conversion, generated images distinct from both endpoints, HUD, resets, resize and in-flight resource retention;
+  translated normal/reversed cameras remain active after warmup while corrupt inverse matrices are rejected.
 - `python3 tools/test_frame_generation_display.py`: native private copies, retention, bounded pair drops, failure and
   stale-epoch handling, measured-source deadlines at 30/60/45/50 fps, reset wakeups and presentation-only counters.
 - `python3 tools/test_fg_geometry_shaders.py`: generated Metal shaders, rigid/deformed motion, sparse/stale indexed
