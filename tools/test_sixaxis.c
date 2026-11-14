@@ -10,7 +10,7 @@
 uint64_t g_alias_base, g_alias_size;
 static bool handheld, available, demand, log_enabled;
 static unsigned demand_calls, sample_reads, diagnostic_lines;
-static char diagnostic_text[512];
+static char diagnostic_text[512], diagnostic_request[512];
 static uint64_t clock_ns = 1000000000ull;
 static InputMotionSnapshot physical;
 static struct {
@@ -36,6 +36,7 @@ void devlog(const char *subject, const char *fmt, ...) {
     if (log_enabled) {
         ++diagnostic_lines;
         va_list args; va_start(args, fmt); vsnprintf(diagnostic_text, sizeof diagnostic_text, fmt, args); va_end(args);
+        if (strstr(diagnostic_text, "SixAxis request")) snprintf(diagnostic_request, sizeof diagnostic_request, "%s", diagnostic_text);
     }
 }
 // Unrelated HID/settings service dependencies are never used by these scenarios.
@@ -50,16 +51,16 @@ void ipc_return_object(IpcResp *resp, Service *service) { (void)resp; (void)serv
 const char *settings_language(void) { return "en-US"; }
 static uint64_t ptr(const void *p) { return (uintptr_t)p; }
 static void closef(float a, float b) { assert(fabsf(a - b) < 0.00001f); }
-static void start(uint32_t *h) { Cpu c = {0}; c.x[0] = ptr(h); six_start(&c); }
-static void stop(uint32_t *h) { Cpu c = {0}; c.x[0] = ptr(h); six_stop(&c); }
+static void start(uint32_t *h) { Cpu c = {0}; c.x[0] = ptr(h); c.x[30] = 0x12340000; six_start(&c); }
+static void stop(uint32_t *h) { Cpu c = {0}; c.x[0] = ptr(h); c.x[30] = 0x12350000; six_stop(&c); }
 static unsigned states(uint32_t *h, int count) {
-    Cpu c = {0}; c.x[0] = ptr(arena.states); c.x[1] = (uint32_t)count; c.x[2] = ptr(h);
+    Cpu c = {0}; c.x[0] = ptr(arena.states); c.x[1] = (uint32_t)count; c.x[2] = ptr(h); c.x[30] = 0x12360000;
     six_get_states(&c); return (unsigned)c.x[0];
 }
 static unsigned handles(uint32_t id, uint32_t style, int count) {
     arena.id = id;
     Cpu c = {0}; c.x[0] = ptr(arena.states); c.x[1] = (uint32_t)count;
-    c.x[2] = ptr(&arena.id); c.x[3] = style; six_get_handles(&c); return (unsigned)c.x[0];
+    c.x[2] = ptr(&arena.id); c.x[3] = style; c.x[30] = 0x12390000; six_get_handles(&c); return (unsigned)c.x[0];
 }
 static void fresh(void) {
     handheld = false; available = true; log_enabled = false;
@@ -186,6 +187,8 @@ static void test_ipc_activation(void) {
         assert(!demand && demand_calls == 0);
     }
     log_enabled = true;
+    assert(handles(0x20, 2, 1) == 1 && !demand);
+    assert(strstr(diagnostic_text, "SixAxis handles") && strstr(diagnostic_text, "guest_lr=0x12390000"));
     assert(ipc_motion_control(66, SIX_HANDHELD, 16) == 0 && demand && demand_calls == 1);
     assert(strstr(diagnostic_text, "origin=ipc"));
     assert(states(&arena.handheld, 1) == 1 && arena.states[0].sampling_number == 42);
@@ -196,6 +199,7 @@ static void test_ipc_activation(void) {
     assert(states(&arena.handheld, 1) == 1 && arena.states[0].sampling_number == 43);
     closef(arena.states[0].acceleration[2], 1); closef(arena.states[0].direction[8], -1);
     start(&arena.handheld); assert(demand_calls == 1 && strstr(diagnostic_text, "origin=hle"));
+    assert(strstr(diagnostic_request, "api=start") && strstr(diagnostic_request, "guest_lr=0x12340000"));
     assert(ipc_motion_control(66, SIX_HANDHELD, 16) == 0 && demand_calls == 1);
     for (unsigned bytes = 0; bytes < 16; bytes++) {
         assert(ipc_motion_control(67, SIX_HANDHELD, bytes) != 0);
@@ -211,6 +215,7 @@ static void test_ipc_activation(void) {
     assert(states(&arena.handheld, 1) == 0);
     handheld = false; assert(states(&arena.fullkey, 1) == 1);
     stop(&arena.fullkey); assert(!demand && demand_calls == 4);
+    assert(strstr(diagnostic_request, "api=stop") && strstr(diagnostic_request, "guest_lr=0x12350000"));
     assert(ipc_motion_control(67, SIX_FULLKEY, 16) == 0 && !demand && demand_calls == 4);
     assert(ipc_motion_control(66, SIX_FULLKEY, 16) == 0 && demand);
     six_reset(); hid_reset();
@@ -226,7 +231,13 @@ static void test_parallel(void) {
     start(&arena.fullkey); log_enabled = true;
     for (int i = 0; i < 100; ++i) assert(states(&arena.fullkey, 1) == 1);
     assert(diagnostic_lines == 1);
-    clock_ns += 1000000000ull; assert(states(&arena.fullkey, 1) == 1 && diagnostic_lines == 2);
+    assert(strstr(diagnostic_text, "api=states") && strstr(diagnostic_text, "guest_lr=0x12360000"));
+    Cpu c = {0}; c.x[0] = ptr(arena.states); c.x[1] = ptr(&arena.fullkey); c.x[30] = 0x12370000;
+    six_get_state(&c); assert(diagnostic_lines == 1); // another read API does not bypass the shared one-second throttle
+    clock_ns += 1000000000ull; six_get_state(&c);
+    assert(diagnostic_lines == 2 && strstr(diagnostic_text, "api=state") && strstr(diagnostic_text, "guest_lr=0x12370000"));
+    clock_ns += 1000000000ull; c.x[0] = ptr(&arena.fullkey); c.x[30] = 0x12380000; six_at_rest(&c);
+    assert(diagnostic_lines == 3 && strstr(diagnostic_text, "api=at-rest") && strstr(diagnostic_text, "guest_lr=0x12380000"));
 }
 int main(int argc, char **argv) {
     assert(argc == 2); fresh();

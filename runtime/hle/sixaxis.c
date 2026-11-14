@@ -93,7 +93,7 @@ static void six_convert(const InputMotionSnapshot *in, SixAxisState *out) {
     }
 }
 // six_lock serializes the started handle state with native demand and read diagnostics.
-static bool six_latest(int slot, SixAxisState *out, bool *at_rest) {
+static bool six_latest(int slot, SixAxisState *out, bool *at_rest, const char *api, uint64_t guest_lr) {
     InputMotionSnapshot sample = {0};
     const char *reason = "invalid-handle";
     bool valid = false;
@@ -115,8 +115,8 @@ static bool six_latest(int slot, SixAxisState *out, bool *at_rest) {
         uint64_t now = plat_now_ns();
         if (!six_last_log || now < six_last_log || now - six_last_log >= 1000000000ull) {
             six_last_log = now;
-            devlog("motion", "SixAxis mode=%s slot=%d status=%s sample=%llu accel=%d gyro=%d rest=%d G=(%.3f,%.3f,%.3f) dirZ=(%.3f,%.3f,%.3f)",
-                   am_handheld() ? "handheld" : "docked", slot, reason, (unsigned long long)out->sampling_number,
+            devlog("motion", "SixAxis mode=%s slot=%d api=%s guest_lr=%#llx status=%s sample=%llu accel=%d gyro=%d rest=%d G=(%.3f,%.3f,%.3f) dirZ=(%.3f,%.3f,%.3f)",
+                   am_handheld() ? "handheld" : "docked", slot, api, (unsigned long long)guest_lr, reason, (unsigned long long)out->sampling_number,
                    sample.acceleration_valid, sample.gyro_valid, *at_rest,
                    out->acceleration[0], out->acceleration[1], out->acceleration[2],
                    out->direction[6], out->direction[7], out->direction[8]);
@@ -135,8 +135,8 @@ HLE_FUNC("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_
                  guest_contains(out, sizeof handle);
     if (valid) memcpy((void *)(uintptr_t)out, &handle, sizeof handle);
     c->x[0] = valid ? 1 : 0;
-    devlog("motion", "SixAxis handles mode=%s id=%#x styles=%#x count=%u handle=%#x",
-           handheld ? "handheld" : "docked", id, style, valid ? 1 : 0, valid ? handle : 0);
+    devlog("motion", "SixAxis handles mode=%s id=%#x styles=%#x count=%u handle=%#x guest_lr=%#llx",
+           handheld ? "handheld" : "docked", id, style, valid ? 1 : 0, valid ? handle : 0, (unsigned long long)c->x[30]);
 }
 bool sixaxis_set_started(uint32_t handle, bool started, SixAxisOrigin origin) {
     int slot = six_slot(handle);
@@ -158,8 +158,10 @@ bool sixaxis_set_started(uint32_t handle, bool started, SixAxisOrigin origin) {
 }
 static void six_set_started(Cpu *c, bool started) {
     uint32_t handle;
-    if (six_read_u32(c->x[0], &handle)) sixaxis_set_started(handle, started, SIXAXIS_ORIGIN_HLE);
-    else devlog("motion", "SixAxis %s origin=hle rejected=invalid-handle-pointer", started ? "start" : "stop");
+    if (six_read_u32(c->x[0], &handle)) {
+        devlog("motion", "SixAxis request api=%s handle=%#x guest_lr=%#llx", started ? "start" : "stop", handle, (unsigned long long)c->x[30]);
+        sixaxis_set_started(handle, started, SIXAXIS_ORIGIN_HLE);
+    } else devlog("motion", "SixAxis %s origin=hle rejected=invalid-handle-pointer guest_lr=%#llx", started ? "start" : "stop", (unsigned long long)c->x[30]);
 }
 HLE_FUNC("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", six_start) { six_set_started(c, true); }
 HLE_FUNC("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", six_stop) { six_set_started(c, false); }
@@ -169,7 +171,7 @@ HLE_FUNC("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19Si
     SixAxisState state;
     bool rest;
     pthread_mutex_lock(&six_lock);
-    six_latest(slot, &state, &rest);
+    six_latest(slot, &state, &rest, "state", c->x[30]);
     pthread_mutex_unlock(&six_lock);
     memcpy((void *)(uintptr_t)c->x[0], &state, sizeof state);
 }
@@ -181,7 +183,7 @@ HLE_FUNC("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19
     SixAxisState state;
     bool rest;
     pthread_mutex_lock(&six_lock);
-    bool valid = six_latest(slot, &state, &rest);
+    bool valid = six_latest(slot, &state, &rest, "states", c->x[30]);
     pthread_mutex_unlock(&six_lock);
     // One real latest report, not a fabricated history at the guest's polling rate.
     if (valid) { memcpy((void *)(uintptr_t)out, &state, sizeof state); c->x[0] = 1; }
@@ -191,7 +193,7 @@ HLE_FUNC("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", six_a
     SixAxisState state;
     bool rest;
     pthread_mutex_lock(&six_lock);
-    bool valid = six_latest(slot, &state, &rest);
+    bool valid = six_latest(slot, &state, &rest, "at-rest", c->x[30]);
     pthread_mutex_unlock(&six_lock);
     c->x[0] = valid && rest;
 }

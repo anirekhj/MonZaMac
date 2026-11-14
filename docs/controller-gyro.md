@@ -62,7 +62,8 @@ documents the coordinate and direction-matrix conventions. The host integrates a
 with gravity; it does not reproduce Nintendo's proprietary fusion filter. Fusion/drift preferences round-trip,
 but those proprietary gain and drift policies are not emulated. GetStates returns one actual latest sample;
 polling does not fabricate extra samples. The default-off `motion` developer-log subject reports handle requests,
-sensor availability/ages and bounded orientation diagnostics.
+sensor availability/ages and bounded orientation diagnostics. Read diagnostics identify the API and guest caller;
+handle enumeration and direct Start/Stop requests also report their guest caller.
 
 Example settings for continuous gyro in `larecomp.ini`:
 
