@@ -38,6 +38,7 @@ extern "C" {
 void input_reset(void);
 void controls_bindings_draw(float scale);  // controls_ui.mm
 #include "../input_bind.h"
+#include "../gyro_input.h"
 #include "../paths.h"
 extern "C" SDL_Window *ui_window(void);  // (runtime/nvn/metal.m)
 }
@@ -1073,6 +1074,49 @@ static void tab_about(void) {
         if (opt_slider("Mouse camera speed", &pct, 25, 300, 5, 100, "%g%%",
                    "How fast the mouse and the trackpad turn the camera. 100% is the default."))
             g_settings.mouse_speed = pct / 100.0f;
+    }
+    ImGui::Spacing();
+    header("Controller gyro");
+    {
+        static const char *const modes[] = {"Off", "Hold L2 / ZL", "Always"};
+        choice("Gyro camera", &g_settings.gyro_camera, modes, 3);
+        hint("Turn the controller to move the camera. Hold L2 / ZL uses the physical left trigger "
+             "(L2, LT or ZL), even if buttons are remapped. The trigger keeps its normal game action. "
+             "Always needs no trigger, including in the game's menus. Gyro pauses only in MonZaMac menus "
+             "and when the game window is not focused.");
+        float percent = roundf(g_settings.gyro_speed * 100);
+        if (opt_slider("Gyro sensitivity", &percent, 10, 500, 5, 100, "%g%%",
+                       "How much controller rotation moves the camera. 100% is the default. "
+                       "The right stick still works alongside gyro."))
+            g_settings.gyro_speed = percent / 100.0f;
+        check_row("Invert gyro horizontal", &g_settings.invert_gyro_x);
+        check_row("Invert gyro vertical", &g_settings.invert_gyro_y);
+        GyroInputStatus status = input_gyro_status();
+        const char *message = "Unavailable";
+        switch (status) {
+        case GYRO_STATUS_DISCONNECTED: message = "No controller connected"; break;
+        case GYRO_STATUS_UNAVAILABLE: message = "Controller gyro unavailable"; break;
+        case GYRO_STATUS_OFF: message = "Off"; break;
+        case GYRO_STATUS_CALIBRATING: message = "Calibrating: keep still"; break;
+        case GYRO_STATUS_READY: message = "Ready"; break;
+        case GYRO_STATUS_ERROR: message = "Sensor error: try calibrating again"; break;
+        }
+        info_row("Gyro status", message);
+        if (g_settings.gyro_camera == GYRO_CAM_OFF ||
+            (status != GYRO_STATUS_READY && status != GYRO_STATUS_ERROR)) opt_disable_next();
+        if (opt_action("Calibrate gyro", "Calibrate",
+                       "Keep this MonZaMac menu open and the controller still for about half a second "
+                       "while calibration learns the resting bias. In Hold mode, also release L2 / LT / ZL."))
+            input_gyro_calibrate();
+        if (status == GYRO_STATUS_OFF)
+            hint("Choose Hold L2 / ZL or Always before calibrating.");
+        else if (status == GYRO_STATUS_DISCONNECTED)
+            hint("Connect a controller with a gyro. Detection may update when the game starts.");
+        else if (status == GYRO_STATUS_UNAVAILABLE)
+            hint("SDL does not expose a gyro for this controller or connection.");
+        else
+            hint("Keep this MonZaMac menu open and the controller still for about half a second to calibrate. "
+                 "In Hold mode, also release L2 / LT / ZL. Recalibrate if the camera drifts at rest.");
     }
     ImGui::Spacing();
     header("Button prompts");

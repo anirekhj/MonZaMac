@@ -1,6 +1,7 @@
 #include "settings.h"
 #include "ui/i18n.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,8 @@ Settings g_settings = {
     // authentic 16:9, sharper textures (anisotropic filtering), a two-finger trackpad swipe turns the camera
     .fullscreen = true,
     .mouse_speed = 1.0f,
+    .gyro_camera = GYRO_CAM_OFF,
+    .gyro_speed = 1.0f,
     .mouse_camera = MOUSE_CAM_HOLD,
     .mouse_camera_button = MOUSE_BTN_RIGHT,
     .cursor_hide_s = 5,
@@ -107,6 +110,11 @@ const char *settings_language_name(void) {
     for (int i = 0; i < N_LANGUAGES; i++)
         if (!strcmp(c, g_language_codes[i])) return g_language_names[i];
     return "English";
+}
+
+static float gyro_speed_clamp(float value) {
+    if (!isfinite(value)) return 1.0f;
+    return value < 0.1f ? 0.1f : value > 5.0f ? 5.0f : value;
 }
 
 void settings_load(void) {
@@ -189,6 +197,21 @@ void settings_load(void) {
         else if (!strcmp(key, "cursor_hide_after")) { int v = atoi(val); g_settings.cursor_hide_s = v < 0 ? 0 : v > 60 ? 60 : v; }
         else if (!strcmp(key, "invert_mouse_x")) g_settings.invert_mouse_x = atoi(val) != 0;
         else if (!strcmp(key, "invert_mouse_y")) g_settings.invert_mouse_y = atoi(val) != 0;
+        else if (!strcmp(key, "gyro_camera")) {
+            char mode[16], extra;
+            g_settings.gyro_camera = GYRO_CAM_OFF;
+            if (sscanf(val, " %15s %c", mode, &extra) == 1)
+                g_settings.gyro_camera = !strcmp(mode, "hold") ? GYRO_CAM_HOLD : !strcmp(mode, "always") ? GYRO_CAM_ALWAYS : GYRO_CAM_OFF;
+        }
+        else if (!strcmp(key, "gyro_speed")) {
+            char *end;
+            float speed = strtof(val, &end);
+            bool parsed = end != val;
+            while (*end == ' ' || *end == '\t' || *end == '\r') end++;
+            g_settings.gyro_speed = parsed && !*end ? gyro_speed_clamp(speed) : 1.0f;
+        }
+        else if (!strcmp(key, "invert_gyro_x")) g_settings.invert_gyro_x = atoi(val) != 0;
+        else if (!strcmp(key, "invert_gyro_y")) g_settings.invert_gyro_y = atoi(val) != 0;
         else if (!strcmp(key, "mirror_mode")) g_settings.mirror_mode = atoi(val) != 0;
         else if (!strcmp(key, "prompts")) g_settings.prompts = !strcmp(val, "nintendo") ? PROMPTS_NINTENDO : !strcmp(val, "xbox") ?
                                                               PROMPTS_XBOX : !strcmp(val, "playstation") ? PROMPTS_PLAYSTATION : !strcmp(val, "keyboard") ? PROMPTS_KEYBOARD : PROMPTS_AUTO;
@@ -270,6 +293,11 @@ void settings_save(void) {
             mouse_cam[g_settings.mouse_camera >= 0 && g_settings.mouse_camera <= 2 ? g_settings.mouse_camera : 1],
             mouse_btn[g_settings.mouse_camera_button >= 0 && g_settings.mouse_camera_button <= 3 ? g_settings.mouse_camera_button : 0],
             g_settings.trackpad_camera, g_settings.invert_mouse_x, g_settings.invert_mouse_y);
+    static const char *const gyro_cam[] = {"off", "hold", "always"};
+    int gyro_mode = g_settings.gyro_camera;
+    fprintf(f, "gyro_camera = %s\ngyro_speed = %g\ninvert_gyro_x = %d\ninvert_gyro_y = %d\n",
+            gyro_cam[gyro_mode >= GYRO_CAM_OFF && gyro_mode <= GYRO_CAM_ALWAYS ? gyro_mode : GYRO_CAM_OFF],
+            gyro_speed_clamp(g_settings.gyro_speed), g_settings.invert_gyro_x, g_settings.invert_gyro_y);
     static const char *const prompts[] = {"auto", "nintendo", "xbox", "playstation", "keyboard"};
     fprintf(f, "prompts = %s\n", prompts[g_settings.prompts <= 4 ? g_settings.prompts : 0]);
     fprintf(f, "mirror_mode = %d\n", g_settings.mirror_mode);

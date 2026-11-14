@@ -53,6 +53,8 @@ extern "C" void input_mouse_release(SDL_Window *w);  // runtime/hle/input.c
 #include "settings.h"
 #include "saves.h"
 #include "input_bind.h"
+#include "gyro_input.h"
+void input_handle_event(const SDL_Event *event);
 #include "precompile_stamp.h"
 void controls_bindings_draw(float scale);  // ui/controls_ui.mm
 void ui_window_init(void);
@@ -1978,7 +1980,11 @@ extern "C" bool launcher_run(const char *root, void (*boot_fn)(const char *)) {
         bool busy = g_busy || test_busy;
         pthread_mutex_unlock(&g_lock);
         SDL_Event e;
-        while (SDL_PollEvent(&e)) {
+        for (unsigned polled = 0; polled < 128 && SDL_PollEvent(&e); polled++) {
+            if (e.type == SDL_EVENT_GAMEPAD_ADDED || e.type == SDL_EVENT_GAMEPAD_REMOVED ||
+                e.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE)
+                input_handle_event(&e);
+            if (e.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE) continue;
             if (e.type == SDL_EVENT_QUIT) exit(0);
             if (play) continue;  // (the game is starting: nothing more to click)
             if (e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN) g_fs_entered = SDL_GetTicks();
@@ -2003,6 +2009,7 @@ extern "C" bool launcher_run(const char *root, void (*boot_fn)(const char *)) {
             if (page == SETTINGS && bind_capture_event(&e)) continue;  // (waiting for a new binding: controls_ui.mm)
             if (!launcher_pad_event(e)) ImGui_ImplSDL3_ProcessEvent(&e);
         }
+        input_gyro_update(NULL);  // prelaunch status/calibration only; never gameplay camera motion
         // extraction finished: re-check, load the background
         pthread_mutex_lock(&g_lock);
         busy = g_busy || test_busy;

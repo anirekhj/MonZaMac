@@ -85,6 +85,8 @@ $(B)/rt/%.o: runtime/%.c $(RT_HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(RTFLAGS) -c $< -o $@
 
+$(B)/rt/hle/input.o $(B)/rt/hle/gyro_camera.o: runtime/hle/gyro_camera.h
+
 # SMAA (third_party/smaa, MIT): the reference shader as a C string for runtime/nvn/smaa_data.c (both backends build
 # their passes from it); the non-ASCII bytes in its comments become '?', and its CRLF line ends plain LF (a CR left in
 # the string literals ends them early on macOS clang)

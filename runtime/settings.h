@@ -26,6 +26,7 @@ extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto"
 
 enum { MOUSE_CAM_OFF, MOUSE_CAM_HOLD /* while a button is held */, MOUSE_CAM_ALWAYS /* cursor held in the window */ };
 enum { MOUSE_BTN_RIGHT, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_ANY };
+enum { GYRO_CAM_OFF = 0, GYRO_CAM_HOLD = 1, GYRO_CAM_ALWAYS = 2 };
 
 typedef struct {
     int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars
@@ -72,6 +73,9 @@ typedef struct {
     bool trackpad_camera;    // two fingers on the trackpad turn the camera (its scroll events)
     int cursor_hide_s;       // online, where the cursor shows in game: hidden after this many seconds without mouse use (0 never)
     bool invert_mouse_x, invert_mouse_y;  // the camera's direction, per axis (mouse and trackpad)
+    int gyro_camera;     // GYRO_CAM_*: Hold uses the physical left trigger (L2 / LT / ZL), independent of remapping
+    float gyro_speed;    // controller gyro sensitivity, 1 = default, finite 0.1..5
+    bool invert_gyro_x, invert_gyro_y;
     int rstick_snap;     // degrees: a right stick this close to an axis is held on it (0 = off; runtime/hle/input.c)
     bool mirror_mode;    // the world mirrored left to right (Gameplay tab): renderers + runtime/hle/input.c
     int ui_language;     // UI_LANG_AUTO or a UI_LANG_* code; independent of the game text language

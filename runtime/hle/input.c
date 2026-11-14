@@ -17,6 +17,9 @@
 #include "../nvn/renderer.h"
 #include "../settings.h"
 #include "../input_bind.h"
+#include "../gyro_input.h"
+#include "../platform.h"
+#include "gyro_camera.h"
 
 enum {
     BTN_A = 0, BTN_B, BTN_X, BTN_Y, BTN_LSTICK, BTN_RSTICK, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
@@ -29,6 +32,10 @@ static _Atomic uint64_t key_buttons, pad_buttons;
 static _Atomic int32_t key_lx, key_ly, key_rx, key_ry, pad_lx, pad_ly, pad_rx, pad_ry;
 static uint8_t keys_down[SDL_SCANCODE_COUNT];
 static SDL_Gamepad *pad;
+static _Atomic uint64_t gyro_stick;  // signed X/Y packed together for a coherent guest read
+static _Atomic uint64_t gyro_expires;  // platform monotonic clock; also stops aim if the UI thread stalls
+static atomic_uint gyro_publish_sequence;
+static _Atomic uint64_t gyro_reset_generation, gyro_published_generation;
 static _Atomic int64_t sampling;
 
 // Host keys / buttons held by a test script (LARECOMP_HOST_INPUT, input_frame): they go through the bindings
@@ -80,6 +87,8 @@ static void recompute_pad(void) {
 
 // Forget held keys (the menu took focus); the gamepad is re-read on its next event.
 void input_reset(void) {
+    // This can run on the renderer: invalidate guest reads now, clear math on the UI thread.
+    atomic_fetch_add(&gyro_reset_generation, 1);
     memset(keys_down, 0, sizeof keys_down);
     recompute_keyboard();
 }
@@ -115,7 +124,7 @@ bool input_user_blocked(const SDL_Event *e) {
     case SDL_EVENT_MOUSE_MOTION: case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
     case SDL_EVENT_MOUSE_WHEEL:
     case SDL_EVENT_GAMEPAD_ADDED: case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-    case SDL_EVENT_GAMEPAD_BUTTON_UP: case SDL_EVENT_JOYSTICK_ADDED: case SDL_EVENT_JOYSTICK_AXIS_MOTION:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP: case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: case SDL_EVENT_JOYSTICK_ADDED: case SDL_EVENT_JOYSTICK_AXIS_MOTION:
     case SDL_EVENT_JOYSTICK_BUTTON_DOWN: case SDL_EVENT_JOYSTICK_BUTTON_UP:
         return true;
     default:
@@ -143,6 +152,167 @@ int input_pad_family(void) {
         env = !e ? -1 : !strcmp(e, "xbox") ? 1 : !strcmp(e, "playstation") || !strcmp(e, "ps") ? 2 : 0;
     }
     return env >= 0 ? env : pad_family;
+}
+
+// Gamepad sensors and their math state are owned only by the UI/event thread.
+// Guest Npad reads use the coherent packed output and never call SDL sensor APIs.
+static GyroCamera gyro_camera;
+static SDL_JoystickID pad_id;
+static bool pads_scanned, pad_has_gyro, pad_has_accel, gyro_enabled, accel_enabled, gyro_enable_error, gyro_focused;
+static uint64_t gyro_enabled_at, gyro_sample_at, gyro_accel_at, gyro_seen_generation;
+static float gyro_accel[3];
+static _Atomic int gyro_status = GYRO_STATUS_DISCONNECTED;
+static atomic_bool gyro_calibrate_request;
+extern bool menu_input_captured(void);
+
+static bool gyro_script_blocked;
+static bool gyro_scripted(void) {
+    const char *no_input = getenv("LARECOMP_NO_USER_INPUT");
+    return (no_input && atoi(no_input)) || getenv("LARECOMP_INPUT") || getenv("LARECOMP_HOST_INPUT") ||
+        getenv("LARECOMP_BIND_TEST") || getenv("LARECOMP_INPUT_REPLAY") || getenv("LARECOMP_ROUTE") ||
+        getenv("LARECOMP_DOORJUMP_TEST") || getenv("LARECOMP_PLACE");
+}
+static bool gyro_active(void) {
+    return pad && gyro_enabled && gyro_focused && atomic_load(&gyro_reset_generation) == gyro_seen_generation && !gyro_script_blocked && !menu_input_captured() &&
+        (g_settings.gyro_camera == GYRO_CAM_ALWAYS || (g_settings.gyro_camera == GYRO_CAM_HOLD &&
+         SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000));
+}
+static void gyro_publish(float x, float y) {
+    int32_t rx = isfinite(x) ? (int32_t)lroundf(fmaxf(-1, fminf(x, 1)) * 32767) : 0;
+    int32_t ry = isfinite(y) ? (int32_t)lroundf(fmaxf(-1, fminf(y, 1)) * 32767) : 0;
+    uint64_t expires = 0;
+    if (rx || ry) {
+        uint64_t host_now = plat_now_ns(), now = SDL_GetTicksNS();
+        if (!gyro_sample_at || now < gyro_sample_at || now - gyro_sample_at >= 150000000) rx = ry = 0;
+        else expires = host_now + (150000000 - (now - gyro_sample_at));
+    }
+    atomic_fetch_add(&gyro_publish_sequence, 1);  // odd: only the UI thread publishes
+    atomic_store(&gyro_expires, expires);
+    atomic_store(&gyro_stick, (uint64_t)(uint32_t)rx | (uint64_t)(uint32_t)ry << 32);
+    atomic_store(&gyro_published_generation, gyro_seen_generation);
+    atomic_fetch_add(&gyro_publish_sequence, 1);
+}
+static uint64_t gyro_guest_stick(void) {
+    unsigned sequence = atomic_load(&gyro_publish_sequence);
+    if (sequence & 1) return 0;
+    uint64_t axes = atomic_load(&gyro_stick), expires = atomic_load(&gyro_expires);
+    uint64_t generation = atomic_load(&gyro_published_generation);
+    if (sequence != atomic_load(&gyro_publish_sequence) || generation != atomic_load(&gyro_reset_generation)) return 0;
+    return axes && plat_now_ns() < expires ? axes : 0;
+}
+static void gyro_deactivate(void) {
+    float x, y;
+    gyro_camera_update(&gyro_camera, SDL_GetTicksNS(), false, NULL, &x, &y);
+    gyro_publish(0, 0);
+}
+static void gyro_stop_sensors(void) {
+    if (pad && gyro_enabled) SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, false);
+    if (pad && accel_enabled) SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, false);
+    gyro_enabled = accel_enabled = false;
+    gyro_enabled_at = gyro_sample_at = gyro_accel_at = 0;
+    gyro_deactivate();
+}
+static void input_pad_open(SDL_JoystickID id) {
+    if (pad) return;
+    pad = SDL_OpenGamepad(id);
+    if (!pad) return;
+    pad_id = SDL_GetGamepadID(pad);
+    pad_has_gyro = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO);
+    pad_has_accel = SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL);
+    gyro_enabled = accel_enabled = gyro_enable_error = false;
+    gyro_camera_reset(&gyro_camera);
+    gyro_publish(0, 0);
+    atomic_store(&gyro_status, pad_has_gyro ? GYRO_STATUS_OFF : GYRO_STATUS_UNAVAILABLE);
+    LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad));
+    note_family();
+}
+static void input_pad_close(void) {
+    gyro_stop_sensors();
+    if (pad) SDL_CloseGamepad(pad);
+    pad = NULL; pad_id = 0;
+    pad_has_gyro = pad_has_accel = gyro_enable_error = false;
+    gyro_camera_reset(&gyro_camera);
+    atomic_store(&gyro_status, GYRO_STATUS_DISCONNECTED);
+    note_family();
+    recompute_pad();
+}
+static void input_pad_scan(void) {
+    if (pads_scanned) return;
+    pads_scanned = true;
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    for (int i = 0; i < n && !pad; i++) input_pad_open(ids[i]);
+    SDL_free(ids);
+}
+GyroInputStatus input_gyro_status(void) { return (GyroInputStatus)atomic_load(&gyro_status); }
+void input_gyro_calibrate(void) {
+    atomic_store(&gyro_calibrate_request, true);
+    atomic_fetch_add(&gyro_reset_generation, 1);
+}
+
+void input_gyro_update(SDL_Window *w) {
+    gyro_script_blocked = gyro_scripted();
+    uint64_t generation = atomic_load(&gyro_reset_generation);
+    if (generation != gyro_seen_generation) { gyro_deactivate(); gyro_seen_generation = generation; }
+    input_pad_scan();
+    if (pad && !SDL_GamepadConnected(pad)) { input_pad_close(); pads_scanned = false; input_pad_scan(); }
+    SDL_WindowFlags flags = w ? SDL_GetWindowFlags(w) : 0;
+    gyro_focused = (flags & SDL_WINDOW_INPUT_FOCUS) && !(flags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
+    if (!pad) { gyro_publish(0, 0); atomic_store(&gyro_status, GYRO_STATUS_DISCONNECTED); return; }
+    bool calibrate = atomic_exchange(&gyro_calibrate_request, false);
+    if (calibrate) {
+        gyro_camera_reset(&gyro_camera);
+        gyro_sample_at = gyro_accel_at = 0;
+        gyro_enable_error = false;
+        gyro_publish(0, 0);
+    }
+    if (!pad_has_gyro) { gyro_publish(0, 0); atomic_store(&gyro_status, GYRO_STATUS_UNAVAILABLE); return; }
+    bool enabled = (g_settings.gyro_camera == GYRO_CAM_HOLD || g_settings.gyro_camera == GYRO_CAM_ALWAYS) && !gyro_script_blocked;
+    if (!enabled) {
+        gyro_stop_sensors(); gyro_enable_error = false;
+        atomic_store(&gyro_status, GYRO_STATUS_OFF);
+        return;
+    }
+    uint64_t now = SDL_GetTicksNS();
+    if (!gyro_enabled && !gyro_enable_error) {
+        SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE, true);
+        gyro_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
+        if (gyro_enabled && pad_has_accel) {
+            accel_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
+            if (!accel_enabled) devlog("gyro", "accelerometer unavailable; using gyro-only local yaw: %s", SDL_GetError());
+        }
+        gyro_enable_error = !gyro_enabled;
+        if (gyro_enable_error) {
+            devlog("gyro", "could not enable gamepad sensors: %s", SDL_GetError());
+            gyro_stop_sensors();
+        } else gyro_enabled_at = now;
+    }
+    if (gyro_enable_error) { gyro_publish(0, 0); atomic_store(&gyro_status, GYRO_STATUS_ERROR); return; }
+    GyroCameraConfig config = {g_settings.gyro_speed, g_settings.invert_gyro_x, g_settings.invert_gyro_y};
+    float x, y;
+    gyro_camera_update(&gyro_camera, now, gyro_active(), &config, &x, &y);
+    gyro_publish(x, y);
+    bool stale = gyro_sample_at ? now < gyro_sample_at || now - gyro_sample_at >= 150000000 : now - gyro_enabled_at >= 1000000000;
+    atomic_store(&gyro_status, stale ? GYRO_STATUS_ERROR : gyro_camera_calibrated(&gyro_camera) ? GYRO_STATUS_READY : GYRO_STATUS_CALIBRATING);
+}
+static void input_gyro_sensor(const SDL_GamepadSensorEvent *e) {
+    if (!pad || e->which != pad_id || !gyro_enabled || gyro_script_blocked) return;
+    uint64_t now = SDL_GetTicksNS();
+    // SDL event timestamps share GetTicksNS's domain; sensor_timestamp may use a
+    // device clock. Preserve queue age so old reports cannot become fresh aim.
+    if (e->timestamp > now) return;  // A future/corrupt report must not become fresh motion.
+    uint64_t stamp = e->timestamp ? e->timestamp : now;
+    if (now - stamp >= 150000000) return;
+    if (e->sensor == SDL_SENSOR_ACCEL && accel_enabled) {
+        memcpy(gyro_accel, e->data, sizeof gyro_accel); gyro_accel_at = stamp;
+    } else if (e->sensor == SDL_SENSOR_GYRO) {
+        if (gyro_sample_at && stamp <= gyro_sample_at) return;
+        const float *accel = gyro_accel_at && stamp >= gyro_accel_at && stamp - gyro_accel_at < 100000000 ? gyro_accel : NULL;
+        gyro_camera_sample(&gyro_camera, stamp, e->data, accel, gyro_active());
+        bool valid = true;
+        for (unsigned i = 0; i < 3; i++) if (!isfinite(e->data[i]) || fabsf(e->data[i]) > 100) valid = false;
+        if (valid) gyro_sample_at = stamp;
+    }
 }
 
 // Right stick snap (Controls > Right stick snap): a direction within `deg` degrees of an axis is held on that axis.
@@ -283,14 +453,7 @@ void input_handle_event(const SDL_Event *e) {
     // (not the scroll: a two-finger drag on the trackpad turns the camera, it does not bring the cursor back)
     if (e->type == SDL_EVENT_MOUSE_MOTION || e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_UP)
         mouse_seen = SDL_GetTicks();
-    static bool scanned;  // pads present at startup: their ADDED event may have gone to the start screen's loop
-    if (!scanned) {
-        scanned = true;
-        int n = 0;
-        SDL_JoystickID *ids = SDL_GetGamepads(&n);
-        if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
-        SDL_free(ids);
-    }
+    input_pad_scan();
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
         // F9: dump the next frame's passes and draw log (developers: LARECOMP_DEVTOOLS=1; a player's key press must not write files)
@@ -302,14 +465,23 @@ void input_handle_event(const SDL_Event *e) {
         recompute_keyboard();
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        input_pad_open(e->gdevice.which);
         break;
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); }
-        recompute_pad();
+        if (pad && pad_id == e->gdevice.which) { input_pad_close(); pads_scanned = false; }
+        break;
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+        input_gyro_sensor(&e->gsensor);
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        gyro_focused = false; gyro_deactivate();
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
         recompute_pad();
+        // A trigger release must not wait for another sensor report or UI tick.
+        if ((g_settings.gyro_camera == GYRO_CAM_HOLD && e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+             e->gaxis.which == pad_id && e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER && e->gaxis.value <= 16000) ||
+            !gyro_active()) gyro_deactivate();
         break;
     case SDL_EVENT_MOUSE_WHEEL:  // Mouse camera "Trackpad": two fingers on the trackpad turn the camera (the mouse wheel too)
         if (g_settings.trackpad_camera) {
@@ -601,6 +773,11 @@ static void fill_state(Cpu *c) {
     mouse_stick(&mrx, &mry);
     int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + mrx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry + mry) + script_ry);
     snap_to_axis(&rx, &ry, g_settings.rstick_snap);
+    if (!menu) {  // Fine gyro aim is intentionally not cardinal-snapped with the manual stick.
+        uint64_t gyro = gyro_guest_stick();
+        rx = clamp_axis(rx + (int32_t)(uint32_t)gyro);
+        ry = clamp_axis(ry + (int32_t)(uint32_t)(gyro >> 32));
+    }
     extern bool mirror_input(void);  // mirror mode, the world on screen (runtime/hle/mirror.c): left and right swap
     bool mirrored = !menu && mirror_input();
     if (mirrored) {

@@ -13,6 +13,7 @@
 #include "frame_generation_present.h"
 #include "frame_generation_display.h"
 #include "../devlog.h"
+#include "../gyro_input.h"
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/QuartzCore.h>
 #include <SDL3/SDL.h>
@@ -1764,7 +1765,37 @@ int ui_run(void) {
     atomic_store(&ui_ready, true);
     double cover_since = 0;  // when the game's first frame was seen (0: not yet)
     if (g_launch_loading) g_launch_loading = 0, ui_loading_cover_show(window, 0);  // (already up when the start screen made it)
+    uint64_t last_window_update = 0;
+    input_gyro_update(window);  // Scan a resting startup controller without waiting for its first input event.
     for (;;) {
+        if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
+        SDL_Event e;
+        bool have_event = SDL_WaitEventTimeout(&e, 16);
+        uint64_t batch_start = SDL_GetTicksNS();
+        for (unsigned handled = 0; have_event; handled++) {
+            do {
+                if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); return RT_REBOOT_NONE; }
+                bool hardware = e.type == SDL_EVENT_GAMEPAD_ADDED || e.type == SDL_EVENT_GAMEPAD_REMOVED ||
+                    e.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE || e.type == SDL_EVENT_WINDOW_FOCUS_LOST;
+                if (atomic_load(&prep_progress)) {
+                    // Modal preparation still services device lifecycle and quiet sensor calibration.
+                    if (hardware) input_handle_event(&e);
+                    break;
+                }
+                if (input_user_blocked(&e)) break;
+                if (hardware) input_handle_event(&e);  // Menus must not swallow removal or sensor reports.
+                if (e.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE) break;
+                if (menu_handle_event(&e)) break;
+                if (!hardware) input_handle_event(&e);
+            } while (0);
+            // A 250–1000 Hz sensor stream must not starve periodic UI work.
+            if (handled >= 127 || SDL_GetTicksNS() - batch_start >= 4000000) break;
+            have_event = SDL_PollEvent(&e);
+        }
+        input_gyro_update(atomic_load(&prep_progress) ? NULL : window);
+        uint64_t periodic_now = SDL_GetTicksNS();
+        if (last_window_update && periodic_now - last_window_update < 16000000) continue;
+        last_window_update = periodic_now;
         if (g_cover) {  // (until the game shows its first frame and two seconds more)
             double now = SDL_GetTicks() / 1000.0;
             if (!cover_since && __atomic_load_n(&g_frame_counter, __ATOMIC_RELAXED) > 0) cover_since = now;
@@ -1775,20 +1806,7 @@ int ui_run(void) {
                                     completionHandler:^{ [gone removeFromSuperview]; }];
             }
         }
-        if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
-        SDL_Event e;
-        while (SDL_WaitEventTimeout(&e, 16)) {
-            if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); return RT_REBOOT_NONE; }
-            if (ui_preparation_update()) {
-                // Device lifecycle still reaches input handling; gameplay events remain modal.
-                if (e.type == SDL_EVENT_GAMEPAD_ADDED || e.type == SDL_EVENT_GAMEPAD_REMOVED) input_handle_event(&e);
-                continue;
-            }
-            if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing
-            if (menu_handle_event(&e)) continue;
-            input_handle_event(&e);
-        }
-        if (!ui_preparation_update()) input_mouse_update(window);  // (Mouse camera "No button": the cursor held in the window)
+        if (!ui_preparation_update()) input_mouse_update(window);
         menu_apply_window_requests(window);
         static long fg_resize_at=-1;static int fg_old_w,fg_old_h;static bool fg_resize_done,fg_restore_done;
         if(fg_resize_at<0)fg_resize_at=getenv("LARECOMP_FG_TEST_RESIZE")?atol(getenv("LARECOMP_FG_TEST_RESIZE")):0;
