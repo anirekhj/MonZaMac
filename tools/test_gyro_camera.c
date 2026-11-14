@@ -154,8 +154,19 @@ static void release(void) {
     read_stick(&c,BASE+MS(20),true,&normal,o); zero(o);
     sample(&c,BASE+MS(15),0,1,0,NULL,true); // late event from before reactivation
     read_stick(&c,BASE+MS(21),true,&normal,o); zero(o);
-    sample(&c,BASE+MS(22),0,0,0,NULL,true);
-    read_stick(&c,BASE+MS(22),true,&normal,o); zero(o);
+    read_stick(&c,BASE+MS(30),true,&normal,o); zero(o);
+    sample(&c,BASE+MS(25),0,.2f,0,NULL,true); // newer than activation, older than latest poll
+    read_stick(&c,BASE+MS(31),true,&normal,o); near(o[0],-gain(.2,1));
+    sample(&c,BASE+MS(32),0,0,0,NULL,false);
+    read_stick(&c,BASE+MS(32),false,&normal,o); zero(o);
+    // The same rejection/acceptance pair when a sample sees activation first.
+    gyro_camera_reset(&c); sample(&c,BASE,0,0,0,NULL,false);
+    read_stick(&c,BASE+MS(20),false,&normal,o); zero(o);
+    sample(&c,BASE+MS(15),0,1,0,NULL,true);
+    read_stick(&c,BASE+MS(21),true,&normal,o); zero(o);
+    read_stick(&c,BASE+MS(30),true,&normal,o); zero(o);
+    sample(&c,BASE+MS(25),0,.2f,0,NULL,true);
+    read_stick(&c,BASE+MS(31),true,&normal,o); near(o[0],-gain(.2,1));
 }
 static void rates(void) {
     const unsigned sensor_rates[]={100,250}, poll_rates[]={30,60,120};

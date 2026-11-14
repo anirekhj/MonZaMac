@@ -96,15 +96,15 @@ static void calibration_sample(GyroCamera *c, uint64_t ns, const float gyro[3], 
 
 void gyro_camera_sample(GyroCamera *c, uint64_t ns, const float gyro[3], const float accel[3], bool active) {
     if (!c) return;
-    activation(c, active);
-    // After a release/menu/focus reset, queued pre-transition reports must not
-    // seed fresh motion just because they arrive after aiming is enabled again.
+    // A sample can discover an activation edge before the next UI poll. It
+    // must be newer than the last known host state, not queued old motion.
     if (!ns || (c->sample_ns && ns <= c->sample_ns) ||
-        (active && !c->have_sample && ns < c->update_ns) || !vector_valid(gyro, 100)) {
+        (active != c->active && ns < c->update_ns) || !vector_valid(gyro, 100)) {
         clear_motion(c);
         clear_quiet(c);
         return;
     }
+    activation(c, active);
     uint64_t elapsed = c->sample_ns ? ns - c->sample_ns : 0;
     if (elapsed >= STALE_NS) { clear_motion(c); clear_quiet(c); }
     bool accel_quiet = accel ? gravity_sample(c, ns, accel) : true;
@@ -124,6 +124,7 @@ void gyro_camera_update(GyroCamera *c, uint64_t ns, bool active,
     if (rx) *rx = 0;
     if (ry) *ry = 0;
     if (!c) return;
+    bool changed = c->active != active;
     activation(c, active);
     if (!ns || (c->update_ns && ns < c->update_ns) || (c->sample_ns && ns < c->sample_ns)) {
         clear_motion(c);
@@ -134,6 +135,9 @@ void gyro_camera_update(GyroCamera *c, uint64_t ns, bool active,
         return;
     }
     c->update_ns = ns;
+    // Reserve a fixed report cutoff on transitions only. Ordinary output polls
+    // cannot move it forward and starve a valid but delayed first report.
+    if (changed && ns > c->sample_ns) c->sample_ns = ns;
     if (!c->sample_ns || ns - c->sample_ns >= STALE_NS) {
         clear_motion(c);
         clear_quiet(c);

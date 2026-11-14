@@ -114,6 +114,14 @@ int main(int argc,char **argv){
  released.gaxis.axis=SDL_GAMEPAD_AXIS_LEFT_TRIGGER;released.gaxis.value=0;
  input_handle_event(&released);assert_zero(); // SDL already reports held again, but queued release must clear history.
  axis_event();input_gyro_update(fake_window);assert_zero();sample(.2f,.5f);
+ input_handle_event(&released);clock_ns+=4000000;axis_event();input_gyro_update(fake_window);
+ clock_ns+=1000000;report(42,SDL_SENSOR_GYRO,.2f,.5f,0,clock_ns-2000000);input_gyro_update(fake_window);assert_zero();
+ // Each report is slightly behind the latest service tick, but newer than the frozen activation boundary.
+ for(int delayed=0;delayed<8;delayed++){
+  clock_ns+=4000000;input_gyro_update(fake_window);
+  report(42,SDL_SENSOR_GYRO,.2f,.5f,0,clock_ns-1000000);input_gyro_update(fake_window);
+  assert(gyro_guest_stick());
+ }
  SDL_Event lost={0};lost.type=SDL_EVENT_WINDOW_FOCUS_LOST;input_handle_event(&lost);
  input_gyro_update(fake_window);assert_zero(); // focus loss/gain before the next report
  sample(.2f,.5f);assert(gyro_guest_stick());
