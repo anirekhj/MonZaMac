@@ -1029,6 +1029,12 @@ extern "C" void menu_language_rows(void) {
 }
 
 static void tab_about(void) {
+    header("Controller gyro");
+    bool gyro_enabled = g_settings.gyro_camera != GYRO_CAM_OFF;
+    if (check_row("Enable gyro camera", &gyro_enabled)) settings_set_gyro_camera_enabled(gyro_enabled);
+    hint("Turn this off to stop gyro camera motion. Your Always or Hold activation choice is kept for next time. "
+         "The game's own motion controls remain available.");
+    ImGui::Spacing();
     header("Movement");
     toggle("D-pad moves the character", &g_settings.dpad_move);
     hint("The d-pad and the arrow keys move like the left stick.");
@@ -1076,10 +1082,12 @@ static void tab_about(void) {
             g_settings.mouse_speed = pct / 100.0f;
     }
     ImGui::Spacing();
-    header("Controller gyro");
+    header("Controller gyro options");
     {
-        static const char *const modes[] = {"Off", "Hold L2 / ZL", "Always"};
-        choice("Gyro camera", &g_settings.gyro_camera, modes, 3);
+        static const char *const modes[] = {"Hold L2 / ZL", "Always"};
+        int activation = g_settings.gyro_camera_mode == GYRO_CAM_HOLD ? 0 : 1;
+        if (choice("Gyro activation", &activation, modes, 2))
+            settings_set_gyro_camera_mode(activation == 0 ? GYRO_CAM_HOLD : GYRO_CAM_ALWAYS);
         hint("Turn the controller to move the camera. Hold L2 / ZL uses the physical left trigger "
              "(L2, LT or ZL), even if buttons are remapped. The trigger keeps its normal game action. "
              "Always needs no trigger, including in the game's menus. Gyro pauses only in MonZaMac menus "
@@ -1109,7 +1117,7 @@ static void tab_about(void) {
                        "while calibration learns the resting bias. In Hold mode, also release L2 / LT / ZL."))
             input_gyro_calibrate();
         if (status == GYRO_STATUS_OFF)
-            hint("Choose Hold L2 / ZL or Always before calibrating.");
+            hint("Check Enable gyro camera before calibrating.");
         else if (status == GYRO_STATUS_DISCONNECTED)
             hint("Connect a controller with a gyro. Detection may update when the game starts.");
         else if (status == GYRO_STATUS_UNAVAILABLE)

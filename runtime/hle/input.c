@@ -13,6 +13,7 @@
 
 #include "../devlog.h"
 #include "../hle.h"
+#include "../kernel.h"
 #include "../nvn/nvn.h"
 #include "../nvn/renderer.h"
 #include "../settings.h"
@@ -20,6 +21,7 @@
 #include "../gyro_input.h"
 #include "../platform.h"
 #include "gyro_camera.h"
+#include "controller_motion.h"
 
 enum {
     BTN_A = 0, BTN_B, BTN_X, BTN_Y, BTN_LSTICK, BTN_RSTICK, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
@@ -37,6 +39,8 @@ static _Atomic uint64_t gyro_expires;  // platform monotonic clock; also stops a
 static atomic_uint gyro_publish_sequence;
 static _Atomic uint64_t gyro_reset_generation, gyro_published_generation;
 static _Atomic int64_t sampling;
+typedef struct InputStyleEvent { KEvent *event; struct InputStyleEvent *next; } InputStyleEvent;
+static InputStyleEvent *style_events;  // g_klock; writable handles keep events alive until kernel reset
 
 // Host keys / buttons held by a test script (LARECOMP_HOST_INPUT, input_frame): they go through the bindings
 static uint8_t test_keys[SDL_SCANCODE_COUNT];
@@ -172,6 +176,87 @@ static bool gyro_scripted(void) {
         getenv("LARECOMP_BIND_TEST") || getenv("LARECOMP_INPUT_REPLAY") || getenv("LARECOMP_ROUTE") ||
         getenv("LARECOMP_DOORJUMP_TEST") || getenv("LARECOMP_PLACE");
 }
+// This channel reports physical motion, independent of camera gain/activation/calibration.
+static ControllerMotion native_motion;
+static atomic_bool motion_requested, motion_available;
+static atomic_uint motion_sequence, motion_flags;
+static _Atomic uint32_t motion_values[18];
+static _Atomic uint64_t motion_number, motion_delta, motion_acceleration_expires, motion_gyro_expires;
+static uint64_t motion_number_offset, motion_last_number;
+static bool native_requested_main, accel_enable_error;
+
+void input_motion_set_enabled(bool enabled) { atomic_store(&motion_requested, enabled); }
+static void motion_clear(void) {
+    atomic_store(&motion_available, false);
+    controller_motion_reset(&native_motion);
+    motion_number_offset = motion_last_number;
+    atomic_fetch_add(&motion_sequence, 1);
+    atomic_store(&motion_flags, 0);
+    atomic_fetch_add(&motion_sequence, 1);
+}
+static uint64_t motion_deadline(uint64_t host_now, uint64_t now, uint64_t stamp) {
+    return stamp && now >= stamp && now - stamp < 150000000 ? host_now + 150000000 - (now - stamp) : 0;
+}
+static void motion_publish(void) {
+    InputMotionSnapshot sample;
+    uint64_t host_now = plat_now_ns(), now = SDL_GetTicksNS();
+    if (!atomic_load(&motion_available) || !controller_motion_read(&native_motion, now, &sample)) {
+        atomic_fetch_add(&motion_sequence, 1); atomic_store(&motion_flags, 0); atomic_fetch_add(&motion_sequence, 1);
+        return;
+    }
+    uint64_t number = motion_number_offset + sample.sampling_number;
+    if (number > motion_last_number) motion_last_number = number;
+    float values[18];
+    memcpy(values, sample.acceleration, 3 * sizeof(float));
+    memcpy(values + 3, sample.angular_velocity, 3 * sizeof(float));
+    memcpy(values + 6, sample.angle, 3 * sizeof(float));
+    memcpy(values + 9, sample.direction, 9 * sizeof(float));
+    unsigned flags = (sample.acceleration_valid ? 1u : 0u) | (sample.gyro_valid ? 2u : 0u) | (sample.at_rest ? 4u : 0u);
+    atomic_fetch_add(&motion_sequence, 1);
+    for (unsigned i = 0; i < 18; i++) { uint32_t bits; memcpy(&bits, &values[i], sizeof bits); atomic_store(&motion_values[i], bits); }
+    atomic_store(&motion_number, motion_last_number); atomic_store(&motion_delta, sample.delta_time_ns);
+    atomic_store(&motion_acceleration_expires, motion_deadline(host_now, now, native_motion.acceleration_ns));
+    atomic_store(&motion_gyro_expires, motion_deadline(host_now, now, native_motion.gyro_ns));
+    atomic_store(&motion_flags, flags);
+    atomic_fetch_add(&motion_sequence, 1);
+}
+bool input_motion_snapshot(InputMotionSnapshot *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof *out);
+    if (!atomic_load(&motion_requested) || !atomic_load(&motion_available)) return false;
+    unsigned sequence = atomic_load(&motion_sequence);
+    if (sequence & 1) return false;
+    float values[18];
+    for (unsigned i = 0; i < 18; i++) { uint32_t bits = atomic_load(&motion_values[i]); memcpy(&values[i], &bits, sizeof bits); }
+    out->sampling_number = atomic_load(&motion_number); out->delta_time_ns = atomic_load(&motion_delta);
+    unsigned flags = atomic_load(&motion_flags);
+    uint64_t acceleration_expires = atomic_load(&motion_acceleration_expires), gyro_expires = atomic_load(&motion_gyro_expires);
+    if (sequence != atomic_load(&motion_sequence) || !atomic_load(&motion_requested) || !atomic_load(&motion_available)) return false;
+    uint64_t now = plat_now_ns();
+    out->acceleration_valid = (flags & 1) && now < acceleration_expires;
+    out->gyro_valid = (flags & 2) && now < gyro_expires;
+    out->at_rest = (flags & 4) && out->acceleration_valid && out->gyro_valid;
+    if (!out->acceleration_valid && !out->gyro_valid) return false;
+    if (out->acceleration_valid) memcpy(out->acceleration, values, 3 * sizeof(float));
+    if (out->gyro_valid) memcpy(out->angular_velocity, values + 3, 3 * sizeof(float));
+    memcpy(out->angle, values + 6, 3 * sizeof(float)); memcpy(out->direction, values + 9, 9 * sizeof(float));
+    return true;
+}
+
+static void motion_log_status(void) {
+    static uint64_t last_log;
+    if (!devlog_on("motion")) return;
+    uint64_t host_now = plat_now_ns();
+    if (last_log && host_now >= last_log && host_now - last_log < 1000000000) return;
+    last_log = host_now;
+    uint64_t now = SDL_GetTicksNS();
+    double acceleration_age = native_motion.acceleration_ns && now >= native_motion.acceleration_ns ? (now - native_motion.acceleration_ns) / 1e6 : -1;
+    double gyro_age = native_motion.gyro_ns && now >= native_motion.gyro_ns ? (now - native_motion.gyro_ns) / 1e6 : -1;
+    devlog("motion", "provider requested=%d pad=%d focus=%d blocked=%d available=%d accel_enabled=%d gyro_enabled=%d accel_age_ms=%.1f gyro_age_ms=%.1f sample=%llu",
+           atomic_load(&motion_requested), pad != NULL, gyro_focused, gyro_script_blocked, atomic_load(&motion_available),
+           accel_enabled, gyro_enabled, acceleration_age, gyro_age, (unsigned long long)motion_last_number);
+}
+
 static bool gyro_active(void) {
     return pad && gyro_enabled && gyro_focused && atomic_load(&gyro_reset_generation) == gyro_seen_generation && !gyro_script_blocked && !menu_input_captured() &&
         (g_settings.gyro_camera == GYRO_CAM_ALWAYS || (g_settings.gyro_camera == GYRO_CAM_HOLD &&
@@ -210,7 +295,7 @@ static void gyro_stop_sensors(void) {
     if (pad && accel_enabled) SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, false);
     gyro_enabled = accel_enabled = false;
     gyro_enabled_at = gyro_sample_at = gyro_accel_at = 0;
-    gyro_deactivate();
+    gyro_deactivate(); motion_clear();
 }
 static void input_pad_open(SDL_JoystickID id) {
     if (pad) return;
@@ -219,7 +304,8 @@ static void input_pad_open(SDL_JoystickID id) {
     pad_id = SDL_GetGamepadID(pad);
     pad_has_gyro = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO);
     pad_has_accel = SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL);
-    gyro_enabled = accel_enabled = gyro_enable_error = false;
+    gyro_enabled = accel_enabled = gyro_enable_error = accel_enable_error = false;
+    native_requested_main = false; motion_clear();
     gyro_camera_reset(&gyro_camera);
     gyro_publish(0, 0);
     atomic_store(&gyro_status, pad_has_gyro ? GYRO_STATUS_OFF : GYRO_STATUS_UNAVAILABLE);
@@ -258,45 +344,59 @@ void input_gyro_update(SDL_Window *w) {
     if (pad && !SDL_GamepadConnected(pad)) { input_pad_close(); pads_scanned = false; input_pad_scan(); }
     SDL_WindowFlags flags = w ? SDL_GetWindowFlags(w) : 0;
     gyro_focused = (flags & SDL_WINDOW_INPUT_FOCUS) && !(flags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
-    if (!pad) { gyro_publish(0, 0); atomic_store(&gyro_status, GYRO_STATUS_DISCONNECTED); return; }
+    bool available = pad && gyro_focused && !gyro_script_blocked;
+    if (!available && atomic_load(&motion_available)) motion_clear();
+    atomic_store(&motion_available, available);
+    if (!pad) { gyro_publish(0, 0); atomic_store(&gyro_status, GYRO_STATUS_DISCONNECTED); motion_log_status(); return; }
+    bool requested = atomic_load(&motion_requested);
+    if (requested && !native_requested_main) gyro_enable_error = accel_enable_error = false;
+    native_requested_main = requested;
     bool calibrate = atomic_exchange(&gyro_calibrate_request, false);
     if (calibrate) {
-        gyro_camera_reset(&gyro_camera);
-        gyro_sample_at = gyro_accel_at = 0;
-        gyro_enable_error = false;
-        gyro_publish(0, 0);
+        gyro_camera_reset(&gyro_camera); gyro_sample_at = gyro_accel_at = 0;
+        gyro_enable_error = accel_enable_error = false; gyro_publish(0, 0);
     }
-    if (!pad_has_gyro) { gyro_publish(0, 0); atomic_store(&gyro_status, GYRO_STATUS_UNAVAILABLE); return; }
-    bool enabled = (g_settings.gyro_camera == GYRO_CAM_HOLD || g_settings.gyro_camera == GYRO_CAM_ALWAYS) && !gyro_script_blocked;
-    if (!enabled) {
-        gyro_stop_sensors(); gyro_enable_error = false;
-        atomic_store(&gyro_status, GYRO_STATUS_OFF);
-        return;
-    }
+    bool camera = (g_settings.gyro_camera == GYRO_CAM_HOLD || g_settings.gyro_camera == GYRO_CAM_ALWAYS) && !gyro_script_blocked;
+    bool native = requested && available;
+    bool want_gyro = pad_has_gyro && ((camera && pad_has_gyro) || native);
+    bool want_accel = pad_has_accel && ((camera && pad_has_gyro) || native);
     uint64_t now = SDL_GetTicksNS();
-    if (!gyro_enabled && !gyro_enable_error) {
-        SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE, true);
-        gyro_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
-        if (gyro_enabled && pad_has_accel) {
-            accel_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
-            if (!accel_enabled) devlog("gyro", "accelerometer unavailable; using gyro-only local yaw: %s", SDL_GetError());
+    if (!want_gyro && !want_accel) {
+        gyro_stop_sensors(); gyro_enable_error = accel_enable_error = false;
+    } else {
+        if ((want_gyro && !gyro_enabled && !gyro_enable_error) || (want_accel && !accel_enabled && !accel_enable_error))
+            SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE, true);
+        if (!want_gyro) {
+            if (gyro_enabled) SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, false);
+            gyro_enabled = gyro_enable_error = false; gyro_sample_at = 0; gyro_deactivate();
+        } else if (!gyro_enabled && !gyro_enable_error) {
+            gyro_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
+            gyro_enable_error = !gyro_enabled;
+            if (gyro_enabled) gyro_enabled_at = now;
+            else devlog("gyro", "could not enable gamepad gyro: %s", SDL_GetError());
         }
-        gyro_enable_error = !gyro_enabled;
-        if (gyro_enable_error) {
-            devlog("gyro", "could not enable gamepad sensors: %s", SDL_GetError());
-            gyro_stop_sensors();
-        } else gyro_enabled_at = now;
+        if (!want_accel) {
+            if (accel_enabled) SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, false);
+            accel_enabled = accel_enable_error = false; gyro_accel_at = 0;
+        } else if (!accel_enabled && !accel_enable_error) {
+            accel_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
+            accel_enable_error = !accel_enabled;
+            if (!accel_enabled) devlog("gyro", "accelerometer unavailable; native tilt unavailable, camera uses local yaw: %s", SDL_GetError());
+        }
     }
+    // Native data is still available when the optional camera is Off or unavailable.
+    motion_publish(); motion_log_status();
+    if (!pad_has_gyro) { gyro_publish(0, 0); atomic_store(&gyro_status, GYRO_STATUS_UNAVAILABLE); return; }
+    if (!camera) { gyro_deactivate(); atomic_store(&gyro_status, GYRO_STATUS_OFF); return; }
     if (gyro_enable_error) { gyro_publish(0, 0); atomic_store(&gyro_status, GYRO_STATUS_ERROR); return; }
     GyroCameraConfig config = {g_settings.gyro_speed, g_settings.invert_gyro_x, g_settings.invert_gyro_y};
-    float x, y;
-    gyro_camera_update(&gyro_camera, now, gyro_active(), &config, &x, &y);
-    gyro_publish(x, y);
+    float x, y; gyro_camera_update(&gyro_camera, now, gyro_active(), &config, &x, &y); gyro_publish(x, y);
     bool stale = gyro_sample_at ? now < gyro_sample_at || now - gyro_sample_at >= 150000000 : now - gyro_enabled_at >= 1000000000;
     atomic_store(&gyro_status, stale ? GYRO_STATUS_ERROR : gyro_camera_calibrated(&gyro_camera) ? GYRO_STATUS_READY : GYRO_STATUS_CALIBRATING);
 }
+
 static void input_gyro_sensor(const SDL_GamepadSensorEvent *e) {
-    if (!pad || e->which != pad_id || !gyro_enabled || gyro_script_blocked) return;
+    if (!pad || e->which != pad_id || gyro_script_blocked) return;
     uint64_t now = SDL_GetTicksNS();
     // SDL event timestamps share GetTicksNS's domain; sensor_timestamp may use a
     // device clock. Preserve queue age so old reports cannot become fresh aim.
@@ -305,7 +405,11 @@ static void input_gyro_sensor(const SDL_GamepadSensorEvent *e) {
     if (now - stamp >= 150000000) return;
     if (e->sensor == SDL_SENSOR_ACCEL && accel_enabled) {
         memcpy(gyro_accel, e->data, sizeof gyro_accel); gyro_accel_at = stamp;
-    } else if (e->sensor == SDL_SENSOR_GYRO) {
+        if (atomic_load(&motion_available)) controller_motion_acceleration(&native_motion, stamp, e->data);
+        motion_publish();
+    } else if (e->sensor == SDL_SENSOR_GYRO && gyro_enabled) {
+        if (atomic_load(&motion_available)) controller_motion_gyroscope(&native_motion, stamp, e->data);
+        motion_publish();
         if (gyro_sample_at && stamp <= gyro_sample_at) return;
         const float *accel = gyro_accel_at && stamp >= gyro_accel_at && stamp - gyro_accel_at < 100000000 ? gyro_accel : NULL;
         gyro_camera_sample(&gyro_camera, stamp, e->data, accel, gyro_active());
@@ -474,7 +578,7 @@ void input_handle_event(const SDL_Event *e) {
         input_gyro_sensor(&e->gsensor);
         break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
-        gyro_focused = false; gyro_deactivate();
+        gyro_focused = false; gyro_deactivate(); motion_clear();
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
         recompute_pad();
@@ -666,7 +770,12 @@ static void host_test_frame(uint64_t frame) {
 
 static uint64_t g_pad_obj;
 volatile int g_inject_plus;  // frames to hold Plus for the game (movie.c: A/B skip the opening)
-RT_ON_RESET(input_reboot_reset) { g_pad_obj = 0; g_inject_plus = 0; }  // (reboot: the controller object was guest memory)
+RT_ON_RESET(input_reboot_reset) {
+    g_pad_obj = 0; g_inject_plus = 0;
+    pthread_mutex_lock(&g_klock);
+    while (style_events) { InputStyleEvent *next = style_events->next; free(style_events); style_events = next; }
+    pthread_mutex_unlock(&g_klock);
+}  // Reset hooks run before kernel_reset releases the boot's handles.
 void input_frame(uint64_t frame) {
     if (g_pad_obj && getenv("LARECOMP_DUMP_PAD") && frame % 600 == 0) {
         const uint8_t *m = (const uint8_t *)(uintptr_t)(g_pad_obj - 0x98);
@@ -750,10 +859,10 @@ static void fill_state(Cpu *c) {
     *(int64_t *)s = ++sampling;
     static int nlog;
     if (nlog < 6 && (sampling % 600) == 1) { nlog++; LOG("[input] GetNpadState id %#x lr %llx\n", id, c->x[30]); }
-    if (id != 0) return;  // docked: only player 1 (FullKey); Handheld stays disconnected
+    if (id != (g_settings.handheld ? 0x20u : 0u)) return;  // Same mode/id reported by the applet operation mode.
     extern uint64_t g_watch_lo, g_watch_hi;
-    if (id == 0 && !g_pad_obj) g_pad_obj = c->x[1] - 8;
-    if (id == 0 && !g_watch_lo && getenv("LARECOMP_WATCH_PAD")) {
+    if (!g_pad_obj) g_pad_obj = c->x[1] - 8;
+    if (!g_watch_lo && getenv("LARECOMP_WATCH_PAD")) {
         unsigned lo = 0x98 + 0x10, hi = 0x98 + 0x48;  // offsets from the controller manager
         sscanf(getenv("LARECOMP_WATCH_PAD"), "%x,%x", &lo, &hi);
         g_watch_lo = c->x[1] - 8 - 0x98 + lo;
@@ -863,12 +972,12 @@ HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left)
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", hid_state_handheld) { fill_state(c); }
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", hid_state_right) { fill_state(c); }
 
-// FullKey for player 1 only (we report docked mode, where Handheld is unavailable)
+// Controller style follows the same configured operation mode as am_handheld().
 HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[0];
     static int nlog;
     if (nlog++ < 4) LOG("[input] GetNpadStyleSet id %#x\n", id);
-    c->x[0] = id == 0 ? 1 : 0;  // docked: no handheld controller
+    c->x[0] = g_settings.handheld ? (id == 0x20 ? 2 : 0) : (id == 0 ? 1 : 0);
 }
 
 // GetTouchScreenStates<1>(TouchScreenState<1> *out, int count) -> states written. TouchScreenState<1>: {s64 sampling,
@@ -899,12 +1008,20 @@ HLE_FUNC("_ZN2nn3hid20GetTouchScreenStatesILm1EEEiPNS0_16TouchScreenStateIXT_EEE
 }
 
 // BindNpadStyleSetUpdateEvent(id, SystemEventType*, clear mode): signaled once so the game sees a
-// controller connected.
-#include "../kernel.h"
+// controller connected. Later mode changes wake every bound id so the SDK can
+// discover both the old controller disconnect and the new controller style.
+void input_style_changed(void) {
+    pthread_mutex_lock(&g_klock);
+    for (InputStyleEvent *item = style_events; item; item = item->next) kernel_signal(item->event);
+    pthread_mutex_unlock(&g_klock);
+}
 HLE_FUNC("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE", hid_bind_style_event) {
+    InputStyleEvent *item = malloc(sizeof *item);
+    if (!item) FATAL("cannot retain controller style event\n");
     uint32_t w, r;
     KEvent *ev = kernel_create_event_pair(&w, &r);
     pthread_mutex_lock(&g_klock);
+    item->event = ev; item->next = style_events; style_events = item;
     kernel_signal(ev);
     pthread_mutex_unlock(&g_klock);
     uint64_t clear_mode = c->x[2];

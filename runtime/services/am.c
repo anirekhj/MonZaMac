@@ -50,11 +50,14 @@ static uint32_t new_event(void) {
 
 // The mode the game is told: docked (1080p, performance boost) or handheld (720p, normal). Handheld draws far fewer pixels.
 bool am_handheld(void) { return g_settings.handheld; }  // (also the render scale's: runtime/nvn/output_scale.c)
+void input_style_changed(void);  // input.c: wake controller-style watchers after a dock/undock
 
 // Switch modes while the game runs: the console tells a game about a dock / undock with these two applet messages, and
 // the game then reads the mode back. Whether Pokémon Z-A reacts live is untested; else it applies from the next start.
 void am_set_handheld(bool on) {
+    if (g_settings.handheld == on) return;
     g_settings.handheld = on;
+    input_style_changed();
     LOG("[am] game mode: %s\n", on ? "handheld" : "docked");
     pthread_mutex_lock(&g_klock);
     if (msg_event && msg_count + 2 <= (int)(sizeof msg_queue / sizeof *msg_queue)) {

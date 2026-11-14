@@ -74,6 +74,7 @@ typedef struct {
     int cursor_hide_s;       // online, where the cursor shows in game: hidden after this many seconds without mouse use (0 never)
     bool invert_mouse_x, invert_mouse_y;  // the camera's direction, per axis (mouse and trackpad)
     int gyro_camera;     // GYRO_CAM_*: Hold uses the physical left trigger (L2 / LT / ZL), independent of remapping
+    int gyro_camera_mode; // remembered Hold/Always activation while the camera is Off
     float gyro_speed;    // controller gyro sensitivity, 1 = default, finite 0.1..5
     bool invert_gyro_x, invert_gyro_y;
     int rstick_snap;     // degrees: a right stick this close to an axis is held on it (0 = off; runtime/hle/input.c)
@@ -91,6 +92,8 @@ extern Settings g_settings;
 
 void settings_load(void);
 void settings_save(void);
+void settings_set_gyro_camera_enabled(bool enabled);
+void settings_set_gyro_camera_mode(int mode); // Hold/Always; changing it while Off does not enable gyro
 bool settings_uncapped_fps(void); // LARECOMP_UNCAPPED_FPS overrides the Developer toggle
 bool settings_temporal_upscale(void); // selected and supported; saved AA and frame generation choices stay independent
 int settings_frame_generation(void); // effective mode: off if unsupported, LARECOMP_FPS is set, or FPS is uncapped

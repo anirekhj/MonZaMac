@@ -31,6 +31,7 @@ Settings g_settings = {
     .fullscreen = true,
     .mouse_speed = 1.0f,
     .gyro_camera = GYRO_CAM_OFF,
+    .gyro_camera_mode = GYRO_CAM_ALWAYS,
     .gyro_speed = 1.0f,
     .mouse_camera = MOUSE_CAM_HOLD,
     .mouse_camera_button = MOUSE_BTN_RIGHT,
@@ -110,6 +111,23 @@ const char *settings_language_name(void) {
     for (int i = 0; i < N_LANGUAGES; i++)
         if (!strcmp(c, g_language_codes[i])) return g_language_names[i];
     return "English";
+}
+
+static int gyro_preferred_mode(void) {
+    int mode = g_settings.gyro_camera;
+    if (mode == GYRO_CAM_HOLD || mode == GYRO_CAM_ALWAYS) return mode;
+    return g_settings.gyro_camera_mode == GYRO_CAM_HOLD ? GYRO_CAM_HOLD : GYRO_CAM_ALWAYS;
+}
+
+void settings_set_gyro_camera_enabled(bool enabled) {
+    g_settings.gyro_camera_mode = gyro_preferred_mode();
+    g_settings.gyro_camera = enabled ? g_settings.gyro_camera_mode : GYRO_CAM_OFF;
+}
+
+void settings_set_gyro_camera_mode(int mode) {
+    bool enabled = g_settings.gyro_camera == GYRO_CAM_HOLD || g_settings.gyro_camera == GYRO_CAM_ALWAYS;
+    g_settings.gyro_camera_mode = mode == GYRO_CAM_HOLD ? GYRO_CAM_HOLD : GYRO_CAM_ALWAYS;
+    g_settings.gyro_camera = enabled ? g_settings.gyro_camera_mode : GYRO_CAM_OFF;
 }
 
 static float gyro_speed_clamp(float value) {
@@ -203,6 +221,12 @@ void settings_load(void) {
             if (sscanf(val, " %15s %c", mode, &extra) == 1)
                 g_settings.gyro_camera = !strcmp(mode, "hold") ? GYRO_CAM_HOLD : !strcmp(mode, "always") ? GYRO_CAM_ALWAYS : GYRO_CAM_OFF;
         }
+        else if (!strcmp(key, "gyro_camera_mode")) {
+            char mode[16], extra;
+            g_settings.gyro_camera_mode = GYRO_CAM_ALWAYS;
+            if (sscanf(val, " %15s %c", mode, &extra) == 1 && !strcmp(mode, "hold"))
+                g_settings.gyro_camera_mode = GYRO_CAM_HOLD;
+        }
         else if (!strcmp(key, "gyro_speed")) {
             char *end;
             float speed = strtof(val, &end);
@@ -234,6 +258,7 @@ void settings_load(void) {
     if (!tip_key) g_settings.menu_tip_seen = true;  // (a settings file from before the note: not a first launch)
     if (!aspect_key) g_settings.aspect_asked = true;  // (likewise: the aspect ratio was chosen already)
     if (shadows_4k_old && !shadow_key) g_settings.shadow_res = g_settings.shadow_sharp = 4;  // ("4K shadows" of the earlier versions: the same, 4x at both)
+    g_settings.gyro_camera_mode = gyro_preferred_mode();  // legacy active modes take precedence over a conflicting remembered mode
     g_settings.aspect = ASPECT_ORIGINAL;  // (for now every save of the settings is shown in the original 16:9; no option)
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
@@ -295,9 +320,10 @@ void settings_save(void) {
             g_settings.trackpad_camera, g_settings.invert_mouse_x, g_settings.invert_mouse_y);
     static const char *const gyro_cam[] = {"off", "hold", "always"};
     int gyro_mode = g_settings.gyro_camera;
-    fprintf(f, "gyro_camera = %s\ngyro_speed = %g\ninvert_gyro_x = %d\ninvert_gyro_y = %d\n",
+    fprintf(f, "gyro_camera = %s\ngyro_camera_mode = %s\ngyro_speed = %g\ninvert_gyro_x = %d\ninvert_gyro_y = %d\n",
             gyro_cam[gyro_mode >= GYRO_CAM_OFF && gyro_mode <= GYRO_CAM_ALWAYS ? gyro_mode : GYRO_CAM_OFF],
-            gyro_speed_clamp(g_settings.gyro_speed), g_settings.invert_gyro_x, g_settings.invert_gyro_y);
+            gyro_cam[gyro_preferred_mode()], gyro_speed_clamp(g_settings.gyro_speed),
+            g_settings.invert_gyro_x, g_settings.invert_gyro_y);
     static const char *const prompts[] = {"auto", "nintendo", "xbox", "playstation", "keyboard"};
     fprintf(f, "prompts = %s\n", prompts[g_settings.prompts <= 4 ? g_settings.prompts : 0]);
     fprintf(f, "mirror_mode = %d\n", g_settings.mirror_mode);

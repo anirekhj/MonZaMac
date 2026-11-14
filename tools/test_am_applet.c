@@ -13,6 +13,8 @@
 Settings g_settings;
 const uint8_t g_user_id[16] = {0};
 volatile int g_rt_unwind;
+static unsigned style_notifications;
+void input_style_changed(void) { style_notifications++; }
 const char *settings_language(void) { return "en-US"; }
 const char *plat_symbol(uint64_t pc, uint64_t *off) { (void)pc; (void)off; return NULL; }
 void rt_fatal_msg(const char *fmt, ...) { (void)fmt; }
@@ -422,6 +424,24 @@ static void check_reset(void) {
     puts("PASS reset isolates applet state");
 }
 
+static void check_mode_notification(void) {
+    g_settings.handheld = false;
+    style_notifications = 0;
+    am_init_once();
+    assert(msg_count == 1);
+    msg_event->signaled = false;
+    am_set_handheld(true);
+    assert(am_handheld() && style_notifications == 1);
+    assert(msg_event->signaled && msg_count == 3);
+    assert(msg_queue[1] == 30 && msg_queue[2] == 31);
+    am_set_handheld(true);
+    assert(style_notifications == 1 && msg_count == 3);
+    am_set_handheld(false);
+    assert(!am_handheld() && style_notifications == 2 && msg_count == 5);
+    assert(msg_queue[3] == 30 && msg_queue[4] == 31);
+    puts("PASS dock/undock notifies controller styles and applet mode watchers");
+}
+
 int main(void) {
     check_event_requery();
     reset();
@@ -436,6 +456,8 @@ int main(void) {
     check_domain_validation();
     reset();
     check_reset();
+    reset();
+    check_mode_notification();
     reset();
     return 0;
 }
