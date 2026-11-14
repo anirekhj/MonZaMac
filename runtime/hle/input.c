@@ -19,6 +19,7 @@
 #include "../settings.h"
 #include "../input_bind.h"
 #include "../gyro_input.h"
+#include "../sixaxis.h"
 #include "../platform.h"
 #include "gyro_camera.h"
 #include "controller_motion.h"
@@ -337,6 +338,7 @@ void input_gyro_calibrate(void) {
 }
 
 void input_gyro_update(SDL_Window *w) {
+    sixaxis_set_always_available(g_settings.native_motion_always);
     gyro_script_blocked = gyro_scripted();
     uint64_t generation = atomic_load(&gyro_reset_generation);
     if (generation != gyro_seen_generation) { gyro_deactivate(); gyro_seen_generation = generation; }

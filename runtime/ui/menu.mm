@@ -1034,6 +1034,9 @@ static void tab_about(void) {
     if (check_row("Enable gyro camera", &gyro_enabled)) settings_set_gyro_camera_enabled(gyro_enabled);
     hint("Turn this off to stop gyro camera motion. Your Always or Hold activation choice is kept for next time. "
          "The game's own motion controls remain available.");
+    check_row("Always provide controller motion", &g_settings.native_motion_always);
+    hint("Keep physical motion available to the game even if it leaves its sensor stopped. "
+         "This is independent of gyro camera and sensitivity. Uncheck to let the game start and stop motion automatically.");
     ImGui::Spacing();
     header("Movement");
     toggle("D-pad moves the character", &g_settings.dpad_move);

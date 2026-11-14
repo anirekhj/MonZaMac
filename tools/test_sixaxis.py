@@ -38,6 +38,7 @@ class SixAxisTests(unittest.TestCase):
     def test_fusion_and_drift_preferences_roundtrip(self): self.check_scenario("controls")
     def test_parallel_handles_and_bounded_diagnostics(self): self.check_scenario("parallel")
     def test_hid_ipc_activation_shared_with_sdk_imports(self): self.check_scenario("ipc")
+    def test_explicit_always_available_policy_and_reset(self): self.check_scenario("policy")
 
 
 if __name__ == "__main__":

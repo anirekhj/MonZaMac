@@ -33,6 +33,7 @@ typedef struct {
 #define SIX_CONTROL_INIT {false, true, {0.03f, 0.4f}, 1}
 static SixAxisControl six_controls[2] = {SIX_CONTROL_INIT, SIX_CONTROL_INIT};
 static pthread_mutex_t six_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool six_always_available;
 static uint64_t six_last_log;
 
 static bool six_read_u32(uint64_t p, uint32_t *out) {
@@ -48,13 +49,24 @@ static int six_arg_slot(uint64_t p) {
     return six_read_u32(p, &handle) ? six_slot(handle) : -1;
 }
 static bool six_current_slot(int slot) { return slot == (am_handheld() ? 1 : 0); }
-static void six_demand(void) {
-    input_motion_set_enabled(six_controls[0].started || six_controls[1].started);
+static bool six_has_demand(void) {
+    return six_always_available || six_controls[0].started || six_controls[1].started;
+}
+static void six_demand(void) { input_motion_set_enabled(six_has_demand()); }
+void sixaxis_set_always_available(bool enabled) {
+    pthread_mutex_lock(&six_lock);
+    if (six_always_available != enabled) {
+        six_always_available = enabled;
+        six_demand();
+        devlog("motion", "SixAxis policy always-available=%d native-demand=%d", enabled, six_has_demand());
+    }
+    pthread_mutex_unlock(&six_lock);
 }
 RT_ON_RESET(six_reset) {
     pthread_mutex_lock(&six_lock);
     const SixAxisControl initial = SIX_CONTROL_INIT;
     six_controls[0] = six_controls[1] = initial;
+    six_always_available = false;
     six_last_log = 0;
     six_demand();
     pthread_mutex_unlock(&six_lock);
@@ -100,7 +112,7 @@ static bool six_latest(int slot, SixAxisState *out, bool *at_rest, const char *a
     six_neutral(out);
     *at_rest = false;
     if (slot >= 0) {
-        if (!six_controls[slot].started) reason = "stopped";
+        if (!six_controls[slot].started && !six_always_available) reason = "stopped";
         else if (!six_current_slot(slot)) reason = "inactive-mode";
         else if (!input_motion_snapshot(&sample)) reason = "unavailable-or-stale";
         else if (!six_finite(&sample)) reason = "invalid-sample";
@@ -115,8 +127,9 @@ static bool six_latest(int slot, SixAxisState *out, bool *at_rest, const char *a
         uint64_t now = plat_now_ns();
         if (!six_last_log || now < six_last_log || now - six_last_log >= 1000000000ull) {
             six_last_log = now;
-            devlog("motion", "SixAxis mode=%s slot=%d api=%s guest_lr=%#llx status=%s sample=%llu accel=%d gyro=%d rest=%d G=(%.3f,%.3f,%.3f) dirZ=(%.3f,%.3f,%.3f)",
-                   am_handheld() ? "handheld" : "docked", slot, api, (unsigned long long)guest_lr, reason, (unsigned long long)out->sampling_number,
+            devlog("motion", "SixAxis mode=%s slot=%d api=%s guest_lr=%#llx status=%s guest_started=%d policy=%d native-demand=%d sample=%llu accel=%d gyro=%d rest=%d G=(%.3f,%.3f,%.3f) dirZ=(%.3f,%.3f,%.3f)",
+                   am_handheld() ? "handheld" : "docked", slot, api, (unsigned long long)guest_lr, reason, slot >= 0 && six_controls[slot].started,
+                   six_always_available, six_has_demand(), (unsigned long long)out->sampling_number,
                    sample.acceleration_valid, sample.gyro_valid, *at_rest,
                    out->acceleration[0], out->acceleration[1], out->acceleration[2],
                    out->direction[6], out->direction[7], out->direction[8]);
@@ -151,8 +164,8 @@ bool sixaxis_set_started(uint32_t handle, bool started, SixAxisOrigin origin) {
         six_controls[slot].started = started;
         six_demand();
     }
-    devlog("motion", "SixAxis %s origin=%s handle=%#x slot=%d changed=%d native-demand=%d", started ? "start" : "stop", source,
-           handle, slot, changed, six_controls[0].started || six_controls[1].started);
+    devlog("motion", "SixAxis %s origin=%s handle=%#x slot=%d changed=%d policy=%d native-demand=%d", started ? "start" : "stop", source,
+           handle, slot, changed, six_always_available, six_has_demand());
     pthread_mutex_unlock(&six_lock);
     return true;
 }

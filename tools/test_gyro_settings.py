@@ -29,14 +29,16 @@ bool bind_settings_load(const char *key, const char *value) { (void)key; (void)v
 void bind_settings_save(FILE *file) { (void)file; }
 int main(int argc, char **argv) {
     settings_load();
-    printf("%d %.9g %d %d %d %.9g %d %d\n", g_settings.gyro_camera, g_settings.gyro_speed,
+    printf("%d %.9g %d %d %d %.9g %d %d %d\n", g_settings.gyro_camera, g_settings.gyro_speed,
            g_settings.invert_gyro_x, g_settings.invert_gyro_y, g_settings.mouse_camera,
-           g_settings.mouse_speed, g_settings.invert_mouse_x, g_settings.gyro_camera_mode);
+           g_settings.mouse_speed, g_settings.invert_mouse_x, g_settings.native_motion_always, g_settings.gyro_camera_mode);
     if (argc == 2) {
         if (!strcmp(argv[1], "disable")) settings_set_gyro_camera_enabled(false);
         else if (!strcmp(argv[1], "enable")) settings_set_gyro_camera_enabled(true);
         else if (!strcmp(argv[1], "hold")) settings_set_gyro_camera_mode(GYRO_CAM_HOLD);
         else if (!strcmp(argv[1], "always")) settings_set_gyro_camera_mode(GYRO_CAM_ALWAYS);
+        else if (!strcmp(argv[1], "native-on")) g_settings.native_motion_always = true;
+        else if (!strcmp(argv[1], "native-off")) g_settings.native_motion_always = false;
         else return 2;
     }
     if (argc == 3) { g_settings.gyro_camera = atoi(argv[1]); g_settings.gyro_speed = strtof(argv[2], NULL); }
@@ -80,14 +82,14 @@ with tempfile.TemporaryDirectory(prefix='gyro-settings-') as name:
             result = subprocess.run([str(binary), *arguments], env=env, capture_output=True, text=True, check=True)
             executions[0] += 1
             values = list(map(float, result.stdout.split()))
-            assert len(values) == 8 and all(math.isfinite(value) for value in values), values
+            assert len(values) == 9 and all(math.isfinite(value) for value in values), values
             return values
         # An old or absent settings file must leave gyro disabled.
         ini.unlink(missing_ok=True)
-        assert run() == [0, 1, 0, 0, 1, 1, 0, 2]
+        assert run() == [0, 1, 0, 0, 1, 1, 0, 0, 2]
         for text, mode, speed, x, y in CASES:
             ini.write_text(LEGACY + text)
-            expected = [mode, speed, x, y, 1, 2.25, 1, mode if mode else 2]
+            expected = [mode, speed, x, y, 1, 2.25, 1, 0, mode if mode else 2]
             first = run()
             assert all(abs(a - b) < 1e-6 for a, b in zip(first, expected)), (text, first, expected)
             saved = read_saved(ini)
@@ -97,6 +99,27 @@ with tempfile.TemporaryDirectory(prefix='gyro-settings-') as name:
             assert saved['invert_gyro_x'] == str(x) and saved['invert_gyro_y'] == str(y)
             second = run()
             assert all(abs(a - b) < 1e-6 for a, b in zip(second, expected)), (text, second, expected)
+        # Native Always is an explicit opt-in; old and malformed files stay automatic.
+        for raw, enabled in [('0', 0), ('1', 1), ('1 \t\r', 1), ('', 0), ('true', 0),
+                             ('-1', 0), ('2', 0), ('1oops', 0), ('1 extra', 0)]:
+            ini.write_text(LEGACY + f'gyro_camera = off\nnative_motion_always = {raw}\n')
+            assert run()[7] == enabled
+            assert read_saved(ini)['native_motion_always'] == str(enabled)
+            assert run()[7] == enabled
+        # The two checkboxes persist independently, including a fresh-process restart.
+        ini.write_text(LEGACY + 'gyro_camera = always\ngyro_speed = 1.375\n')
+        run(('native-on',))
+        state = run()
+        assert state[0] == 2 and state[1] == 1.375 and state[7] == 1
+        run(('disable',))
+        state = run()
+        assert state[0] == 0 and state[7] == 1 and state[-1] == 2
+        run(('native-off',))
+        state = run()
+        assert state[0] == 0 and state[7] == 0 and state[-1] == 2
+        run(('enable',))
+        state = run()
+        assert state[0] == 2 and state[7] == 0
         # Saving an invalid in-memory mode/speed also writes a finite, bounded setting.
         for mode, raw_speed, saved_speed in [('99', 'nan', 1), ('-1', 'inf', 1), ('1', '-3', .1), ('2', '20', 5)]:
             ini.write_text(LEGACY)
@@ -141,4 +164,4 @@ with tempfile.TemporaryDirectory(prefix='gyro-settings-') as name:
         run(('enable',))
         state = run()
         assert state[0] == state[-1] == 2
-    print(f'PASS: {executions[0]} native/portable gyro settings, legacy migration, enable/disable restoration and round trips')
+    print(f'PASS: {executions[0]} native/portable gyro/native-motion settings, migration, independent toggles and round trips')

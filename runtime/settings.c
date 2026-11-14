@@ -33,6 +33,7 @@ Settings g_settings = {
     .gyro_camera = GYRO_CAM_OFF,
     .gyro_camera_mode = GYRO_CAM_ALWAYS,
     .gyro_speed = 1.0f,
+    .native_motion_always = false,
     .mouse_camera = MOUSE_CAM_HOLD,
     .mouse_camera_button = MOUSE_BTN_RIGHT,
     .cursor_hide_s = 5,
@@ -236,6 +237,10 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "invert_gyro_x")) g_settings.invert_gyro_x = atoi(val) != 0;
         else if (!strcmp(key, "invert_gyro_y")) g_settings.invert_gyro_y = atoi(val) != 0;
+        else if (!strcmp(key, "native_motion_always")) {
+            char enabled[8], extra;
+            g_settings.native_motion_always = sscanf(val, " %7s %c", enabled, &extra) == 1 && !strcmp(enabled, "1");
+        }
         else if (!strcmp(key, "mirror_mode")) g_settings.mirror_mode = atoi(val) != 0;
         else if (!strcmp(key, "prompts")) g_settings.prompts = !strcmp(val, "nintendo") ? PROMPTS_NINTENDO : !strcmp(val, "xbox") ?
                                                               PROMPTS_XBOX : !strcmp(val, "playstation") ? PROMPTS_PLAYSTATION : !strcmp(val, "keyboard") ? PROMPTS_KEYBOARD : PROMPTS_AUTO;
@@ -324,6 +329,7 @@ void settings_save(void) {
             gyro_cam[gyro_mode >= GYRO_CAM_OFF && gyro_mode <= GYRO_CAM_ALWAYS ? gyro_mode : GYRO_CAM_OFF],
             gyro_cam[gyro_preferred_mode()], gyro_speed_clamp(g_settings.gyro_speed),
             g_settings.invert_gyro_x, g_settings.invert_gyro_y);
+    fprintf(f, "native_motion_always = %d\n", g_settings.native_motion_always);
     static const char *const prompts[] = {"auto", "nintendo", "xbox", "playstation", "keyboard"};
     fprintf(f, "prompts = %s\n", prompts[g_settings.prompts <= 4 ? g_settings.prompts : 0]);
     fprintf(f, "mirror_mode = %d\n", g_settings.mirror_mode);

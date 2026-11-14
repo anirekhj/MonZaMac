@@ -22,6 +22,8 @@ SOURCE = r'''
 #include <errno.h>
 
 Settings g_settings;
+uint64_t g_alias_base, g_alias_size;
+bool am_handheld(void){return g_settings.handheld;}
 pthread_mutex_t g_klock=PTHREAD_MUTEX_INITIALIZER;
 static KEvent style_pool[16];
 static unsigned style_signals[16],style_created,style_attached;
@@ -151,6 +153,33 @@ static void native_test(void) {
  puts("PASS: native motion with camera Off, independent calibration/overlay, tilt, channel capability, expiry and monotonic sampling");
 }
 
+static void native_always_test(void) {
+ InputMotionSnapshot motion;
+ assert(g_settings.gyro_camera==GYRO_CAM_OFF&&!atomic_load(&motion_requested));
+ g_settings.native_motion_always=true;input_gyro_update(fake_window);
+ assert(atomic_load(&motion_requested)&&gyro_enabled&&accel_enabled);assert_zero();
+ native_report();assert(input_motion_snapshot(&motion));assert(motion.acceleration[1]<-9.8f&&motion.direction[4]<-.95f);
+ assert(input_gyro_status()==GYRO_STATUS_OFF);assert_zero();
+ assert(sixaxis_set_started(0x20003,false,SIXAXIS_ORIGIN_IPC));
+ input_gyro_update(fake_window);native_report();assert(input_motion_snapshot(&motion));assert_zero();
+ g_settings.native_motion_always=false;input_gyro_update(fake_window);
+ assert(!atomic_load(&motion_requested)&&!gyro_enabled&&!accel_enabled&&!input_motion_snapshot(&motion));
+ assert(sixaxis_set_started(0x20003,true,SIXAXIS_ORIGIN_HLE));
+ g_settings.native_motion_always=true;input_gyro_update(fake_window);
+ g_settings.native_motion_always=false;input_gyro_update(fake_window);native_report();
+ assert(atomic_load(&motion_requested)&&input_motion_snapshot(&motion));assert_zero();
+ assert(sixaxis_set_started(0x20003,false,SIXAXIS_ORIGIN_IPC));input_gyro_update(fake_window);
+ assert(!atomic_load(&motion_requested)&&!input_motion_snapshot(&motion));
+ // A setting changed while no pad exists must reach the broker before the early return.
+ connected=false;available=false;g_settings.native_motion_always=true;input_gyro_update(fake_window);
+ assert(!pad&&atomic_load(&motion_requested)&&!input_motion_snapshot(&motion));
+ connected=true;available=true;SDL_Event added={0};added.type=SDL_EVENT_GAMEPAD_ADDED;added.gdevice.which=42;
+ input_handle_event(&added);input_gyro_update(fake_window);native_report();assert(input_motion_snapshot(&motion));assert_zero();
+ window_flags=0;input_gyro_update(fake_window);assert(!input_motion_snapshot(&motion));
+ window_flags=SDL_WINDOW_INPUT_FOCUS;input_gyro_update(fake_window);native_report();assert(input_motion_snapshot(&motion));
+ clock_ns+=150000000;assert(!input_motion_snapshot(&motion));assert_zero();
+ puts("PASS: actual native policy broker, camera Off, Stop, guest demand preservation, disconnected setting, focus and stale guards");
+}
 int main(int argc,char **argv){
  assert(argc==2);style_test();g_settings.gyro_speed=1;g_settings.mouse_speed=1;
  for(int i=0;i<BIND_PAD_COUNT;i++)g_bind_pad[i]=-1;
@@ -161,6 +190,7 @@ int main(int argc,char **argv){
  if(!strcmp(argv[1],"gyro-failure"))fail_gyro=true;
  input_gyro_update(fake_window);
  assert(open_count==1&&capability_calls==2&&enable_gyro==0&&enable_accel==0);assert_zero();
+ if(!strcmp(argv[1],"native-always")){native_always_test();return 0;}
  if(!strncmp(argv[1],"native-",7)){native_test();return 0;}
  if(!have_gyro){assert(input_gyro_status()==GYRO_STATUS_UNAVAILABLE);return 0;}
  assert(input_gyro_status()==GYRO_STATUS_OFF);
@@ -249,11 +279,11 @@ with tempfile.TemporaryDirectory(prefix='monzamac-gyro-input-') as directory:
     subprocess.run(['xcrun','clang','-std=gnu11','-O2','-Wall','-Wextra','-Werror','-Wno-unused-function',
                     '-Wno-unused-parameter','-Wno-c23-extensions','-fno-strict-aliasing','-isysroot',sdk,
                     '-I',str(ROOT),'-I',str(ROOT/'runtime'),'-I',str(ROOT/'runtime/nvn'),'-I',str(prefix/'include'),
-                    str(fixture),str(ROOT/'runtime/hle/gyro_camera.c'),str(ROOT/'runtime/hle/controller_motion.c'),'-L',str(prefix/'lib'),'-lSDL3',
+                    str(fixture),str(ROOT/'runtime/hle/gyro_camera.c'),str(ROOT/'runtime/hle/controller_motion.c'),str(ROOT/'runtime/hle/sixaxis.c'),'-L',str(prefix/'lib'),'-lSDL3',
                     '-Wl,-rpath,'+str(prefix/'lib'),'-Wl,-dead_strip','-o',str(binary)],check=True)
     env = {k:v for k,v in os.environ.items() if not k.startswith(('LARECOMP_','LUMIOSE_','SDL_'))}
-    for case in ('normal','unavailable','no-accel','accel-failure','gyro-failure','scripted','native-full','native-accel-only','native-gyro-only'):
+    for case in ('normal','unavailable','no-accel','accel-failure','gyro-failure','scripted','native-full','native-accel-only','native-gyro-only','native-always'):
         case_env = dict(env)
         if case == 'scripted': case_env['LARECOMP_INPUT_REPLAY']='synthetic-unused-route'
         subprocess.run([str(binary),case],check=True,cwd=tmp,env=case_env,timeout=10)
-print('PASS: nine synthetic SDL routing groups; no SDL_Init or hardware discovery')
+print('PASS: ten synthetic SDL routing groups; no SDL_Init or hardware discovery')

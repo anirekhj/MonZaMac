@@ -221,6 +221,37 @@ static void test_ipc_activation(void) {
     six_reset(); hid_reset();
     assert(!demand && states(&arena.fullkey, 1) == 0);
 }
+static void test_always_available_policy(void) {
+    handheld = true;
+    assert(states(&arena.handheld, 1) == 0 && !demand);
+    sixaxis_set_always_available(true);
+    assert(demand && demand_calls == 1 && !six_controls[0].started && !six_controls[1].started);
+    assert(states(&arena.handheld, 1) == 1 && arena.states[0].sampling_number == 42);
+    sixaxis_set_always_available(true); assert(demand_calls == 1);
+    stop(&arena.handheld); assert(demand && demand_calls == 1);
+    assert(ipc_motion_control(67, SIX_HANDHELD, 16) == 0 && demand);
+    assert(states(&arena.handheld, 1) == 1);
+    assert(states(&arena.fullkey, 1) == 0 && states(&arena.invalid, 1) == 0);
+    available = false; assert(states(&arena.handheld, 1) == 0); available = true;
+    physical.direction[0] = NAN; assert(states(&arena.handheld, 1) == 0); physical.direction[0] = 1;
+    log_enabled = true; clock_ns += 1000000000ull;
+    assert(states(&arena.handheld, 1) == 1);
+    assert(strstr(diagnostic_text, "guest_started=0 policy=1 native-demand=1"));
+    log_enabled = false;
+    sixaxis_set_always_available(false);
+    assert(!demand && states(&arena.handheld, 1) == 0);
+    sixaxis_set_always_available(true); start(&arena.handheld); start(&arena.fullkey);
+    sixaxis_set_always_available(false);
+    assert(demand && six_controls[0].started && six_controls[1].started);
+    assert(states(&arena.handheld, 1) == 1);
+    stop(&arena.handheld); assert(demand && states(&arena.handheld, 1) == 0);
+    handheld = false; assert(states(&arena.fullkey, 1) == 1);
+    stop(&arena.fullkey); assert(!demand && states(&arena.fullkey, 1) == 0);
+    sixaxis_set_always_available(true); start(&arena.fullkey); six_reset();
+    assert(!demand && !six_always_available && !six_controls[0].started && !six_controls[1].started);
+    assert(states(&arena.fullkey, 1) == 0);
+    assert(handles(0, 1, 1) == 1 && !demand); // reboot/getter enumeration cannot re-enable policy
+}
 static void *toggle(void *p) { for (int i = 0; i < 10000; ++i) { start(p); stop(p); } return NULL; }
 static void test_parallel(void) {
     pthread_t a, b;
@@ -248,6 +279,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "controls")) test_controls();
     else if (!strcmp(argv[1], "parallel")) test_parallel();
     else if (!strcmp(argv[1], "ipc")) test_ipc_activation();
+    else if (!strcmp(argv[1], "policy")) test_always_available_policy();
     else assert(!"unknown scenario");
     puts("PASS 1 SixAxis scenario");
     return 0;

@@ -77,6 +77,7 @@ typedef struct {
     int gyro_camera_mode; // remembered Hold/Always activation while the camera is Off
     float gyro_speed;    // controller gyro sensitivity, 1 = default, finite 0.1..5
     bool invert_gyro_x, invert_gyro_y;
+    bool native_motion_always; // provide native controller motion even without a guest sensor start
     int rstick_snap;     // degrees: a right stick this close to an axis is held on it (0 = off; runtime/hle/input.c)
     bool mirror_mode;    // the world mirrored left to right (Gameplay tab): renderers + runtime/hle/input.c
     int ui_language;     // UI_LANG_AUTO or a UI_LANG_* code; independent of the game text language

@@ -35,15 +35,18 @@ axes otherwise. The optional camera mapping and the game's native motion input a
 
 ## Native game motion
 
-When the game starts a motion sensor, physical acceleration, rotation and orientation are also available through
-the SixAxis interface. This continues with **Enable gyro camera** unchecked and is independent of camera sensitivity,
+By default, native motion is automatic: the game starts and stops its SixAxis sensor. Check **Always provide controller
+motion**, beside **Enable gyro camera** in Controls, to keep real physical acceleration, rotation and orientation
+available even if the game leaves its sensor stopped. Uncheck it to return to automatic activation. This option
+starts disabled for existing settings files. It is independent of **Enable gyro camera**, camera sensitivity,
 inversion and recalibration. Ordinary MonZaMac Controls overlays do not reset it. Loss of window focus, hidden or
 minimized windows, preparation/launcher pages, scripted input, disconnected devices and stale reports suppress native
-readings. Sensor channels are enabled only while either the camera or native game input needs them.
+readings. Sensor channels are enabled only while the camera, a guest sensor request or this explicit Always option needs them.
 
 Direct SDK sensor starts and HID service commands 66/67 share the same activation state. Starting an already
 active handle is idempotent, and stopping one handle keeps sensing enabled while another handle needs it.
-Enumerating handles or reading states does not start a sensor. The `motion` diagnostic identifies the activation
+Enumerating handles or reading states does not change those activation flags; the Always option overrides native sample availability.
+The `motion` diagnostic identifies the activation
 source as `hle` or `ipc` so a physical-controller run can confirm which route the game uses.
 
 The virtual controller matches **Video → Game mode**: Docked uses player 1 / FullKey; Handheld uses the handheld
@@ -51,7 +54,8 @@ controller ID and style. A dock/undock also signals controller-style watchers. R
 a live mode change is incomplete; selecting the mode in the launcher before Continue avoids that dependency.
 
 For an [Inkay evolution test](https://www.gamesradar.com/games/pokemon/pokemon-legends-z-a-inkay-evolve-malamar/),
-use **Handheld** mode with an Inkay at level 30 or higher in the party. Hold the controller upside down while
+use **Handheld** mode with an Inkay at level 30 or higher in the party, and check **Always provide controller motion**.
+Hold the controller upside down while
 opening Inkay's party-menu actions and select **Evolve**. Camera gyro can be disabled for this. The native motion
 and handheld paths have synthetic regressions; the actual evolution still needs a physical-controller playtest.
 
@@ -76,6 +80,8 @@ invert_gyro_y = 0
 ```
 
 `gyro_camera` remains the effective setting: `off`, `hold`, or `always`; invalid values become `off`.
+`native_motion_always = 1` enables the explicit native-motion override; `0` is automatic and remains the default
+when the key is absent or malformed. It does not enable gyro camera mapping.
 `gyro_camera_mode` remembers `hold` or `always` while the camera is off. Older files with an active mode keep it;
 an active `gyro_camera` value takes precedence over a conflicting remembered mode. Finite sensitivity values are
 clamped to 0.1–5.0, and malformed or nonfinite values use 1.0. Changes apply while playing and are saved with the other
