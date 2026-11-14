@@ -34,7 +34,7 @@ static void uniform_snapshots(void) {
     id<MTLComputePipelineState> pipe = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"copy_value"] error:&err];
     CHECK(pipe != nil, "snapshot test pipeline compiles");
     id<MTLBuffer> result = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
-    id<MTLCommandBuffer> command = [renderer_queue() commandBuffer];
+    id<MTLCommandBuffer> command = cb();  // register the pending ring reader with the renderer fence tracker
     id<MTLComputeCommandEncoder> e = [command computeCommandEncoder];
     [e setComputePipelineState:pipe];
     [e setBuffer:result offset:0 atIndex:1];
@@ -50,9 +50,12 @@ static void uniform_snapshots(void) {
         [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     }
     [e endEncoding];
-    [command commit];
+    renderer_submit();
     [command waitUntilCompleted];
     CHECK(command.error == nil, "snapshot GPU reads complete");
+    if(((uint32_t *)result.contents)[0]!=17 || ((uint32_t *)result.contents)[1]!=23 || ((uint32_t *)result.contents)[2]!=31)
+        fprintf(stderr,"snapshot GPU values: %u %u %u (expected 17 23 31)\n",
+                ((uint32_t *)result.contents)[0],((uint32_t *)result.contents)[1],((uint32_t *)result.contents)[2]);
     CHECK(((uint32_t *)result.contents)[0] == 17 && ((uint32_t *)result.contents)[1] == 23 &&
           ((uint32_t *)result.contents)[2] == 31,
           "GPU retains snapshots across source changes and ring replacement before submission");
@@ -66,12 +69,24 @@ static void uniform_snapshots(void) {
     ring_alloc(overwrite, sizeof overwrite);
     CHECK(*(uint32_t *)(ring_data + fresh) == 55, "reset invalidates reused offsets before new allocations overwrite them");
     id<MTLBuffer> previous = ring;
+    // A completed ring may legally be recycled. Keep this one genuinely in
+    // flight so replacement must preserve both the old and new GPU snapshots.
+    command=cb();e=[command computeCommandEncoder];
+    [e setComputePipelineState:pipe];[e setBuffer:result offset:0 atIndex:1];
+    uint32_t index=0;
+    [e setBuffer:previous offset:fresh atIndex:0];[e setBytes:&index length:sizeof index atIndex:2];
+    [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
     ring_off = RING_SIZE;
     ring_alloc(overwrite, 16);
-    CHECK(ring != previous, "ring exhaustion creates a new buffer");
+    CHECK(ring != previous, "ring exhaustion does not recycle a pending GPU reader's buffer");
     uint64_t wrapped = ring_snapshot(value, sizeof value);
     CHECK(*(uint32_t *)(ring_data + wrapped) == 55 && *(uint32_t *)((uint8_t *)previous.contents + fresh) == 55,
           "ring replacement preserves the old snapshot and copies uniforms into the new buffer");
+    index=1;[e setBuffer:ring offset:wrapped atIndex:0];[e setBytes:&index length:sizeof index atIndex:2];
+    [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];[e endEncoding];
+    renderer_submit();[command waitUntilCompleted];
+    CHECK(command.error==nil && ((uint32_t *)result.contents)[0]==55 && ((uint32_t *)result.contents)[1]==55,
+          "both ring generations retain their GPU snapshots until the tracked submission completes");
 }
 
 static void gpu_interval_union(void) {
@@ -1256,11 +1271,31 @@ static void sampler_bias(void) {
     }
 }
 
-static bool native_sampler_available(void) {
-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
-    if (@available(macOS 26.0, *)) return true;
-#endif
-    return false;
+static void sampler_capability(void) {
+    // Exercise the production descriptor on every device. Apple9 and earlier
+    // must keep the existing fallback rather than request unsupported APIs.
+    const bool native = native_sampler_features_available();
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                                               width:2 height:2 mipmapped:YES];
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> texture = [dev newTextureWithDescriptor:td];
+    const float texels[] = {0, 1, 1, 1}, mip = 2;
+    [texture replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:texels bytesPerRow:8];
+    [texture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:1 withBytes:&mip bytesPerRow:4];
+    const struct { uint8_t reduction; float bias, lod, native_value, fallback_value; } cases[] = {
+        {1, 0, 0, 0, 0.75f}, {2, 0, 0, 1, 0.75f},
+        {0, 1, 0, 2, 0.75f}, {0, -1, 1, 0.75f, 2},
+    };
+    for (unsigned mf = 3; mf <= 5; mf += 2) for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
+        NvnSamplerDesc desc = test_sampler(); desc.min_filter = mf;
+        desc.reduction = cases[i].reduction; desc.lod_bias = cases[i].bias;
+        float got[4]; sample_pixel(texture, &desc, 0.5f, 0.5f, cases[i].lod, got);
+        const float want = native ? cases[i].native_value : cases[i].fallback_value;
+        fprintf(stderr, "sampler capability native=%d min=%u reduction=%u bias=%g got=%g want=%g\n",
+                native, mf, desc.reduction, desc.lod_bias, got[0], want);
+        CHECK(fabsf(got[0] - want) < 0.00001f, "sampler must use supported native semantics or the existing device fallback");
+        CFRelease(desc.backend);
+    }
 }
 
 enum { TEX_FETCH, TEX_SAMPLE, TEX_GATHER, TEX_MISSING_SHAPE, TEX_FEEDBACK, TEX_MODE_COUNT };
@@ -1718,6 +1753,55 @@ static void shader_early_snapshot(void) {
     early_recipes = @[recipe];
     [early_attempted removeAllObjects]; [early_submitted removeAllObjects]; early_checked_revision = UINT64_MAX; early_frame();
     CHECK(!early_inflight && !early_submitted.count, "already prepared/live variants never compile twice");
+    // Both MetalFX motion modes use learned PSOs instead of compiling at their first live draw.
+    for (unsigned mode = 1; mode <= 2; mode++) {
+        ShaderKey mv = live_vk, mf = live_fk;
+        mv.fg_motion = mode == 1 ? 1 : 0; mf.fg_motion = mode;
+        MTLRenderPipelineDescriptor *pd = prep_descriptor(recipe[@"pipeline"], nil);
+        pd.colorAttachments[7].pixelFormat = MTLPixelFormatRG16Float;
+        pd.colorAttachments[7].writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskGreen;
+        NSDictionary *program = prep_program_record(&moved, &mv, &mf);
+        NSDictionary *motion_recipe = @{@"version": @1, @"program": program, @"pipeline": prep_descriptor_dict(pd)};
+        CHECK(recipe_valid(motion_recipe) && recipe_line(motion_recipe), "motion recipes pass metadata-only validation");
+        early_recipes = @[motion_recipe];
+        [early_attempted removeAllObjects]; [early_submitted removeAllObjects]; early_checked_revision = UINT64_MAX;
+        early_frame(); dispatch_group_wait(early_group, DISPATCH_TIME_FOREVER); early_publish();
+        unsigned before = g_prep_program_hits, before_pipeline = g_prep_pipeline_hits;
+        int compiles = stat_compiles;
+        Prog *motion = get_program(&moved, &mv, &mf);
+        CHECK(motion && motion->ready && !motion->early_pending, "background motion compilation completes before live use");
+        id<MTLRenderPipelineState> pipeline = prep_pipeline(motion, pd);
+        CHECK(motion->fi->uses_fg_motion && pipeline &&
+              g_prep_program_hits == before + 1 && g_prep_pipeline_hits == before_pipeline + 1 && stat_compiles == compiles,
+              "first live motion use reuses the exact early program and pipeline without compilation");
+        renderer_flush();
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float width:4 height:4 mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModeShared;
+        id<MTLTexture> vectors = [dev newTextureWithDescriptor:td];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = renderer_texture(&color, nil, true);
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[7].texture = vectors;
+        rp.colorAttachments[7].loadAction = MTLLoadActionClear; rp.colorAttachments[7].storeAction = MTLStoreActionStore;
+        id<MTLCommandBuffer> cb = [renderer_queue() commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:pipeline];
+        [enc setVertexBuffer:g_guest_buffer offset:0 atIndex:pd.vertexDescriptor.attributes[0].bufferIndex];
+        id<MTLBuffer> history = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        uint32_t params[4] = {0}; float viewport[4] = {4, 4, 0, 0}, tint[8] = {0};
+        [enc setVertexBuffer:history offset:0 atIndex:FG_CURRENT_BUFFER_INDEX];
+        [enc setVertexBuffer:history offset:0 atIndex:FG_PREVIOUS_BUFFER_INDEX];
+        [enc setVertexBytes:params length:sizeof params atIndex:FG_PARAMS_BUFFER_INDEX];
+        [enc setFragmentBytes:viewport length:sizeof viewport atIndex:FG_PARAMS_BUFFER_INDEX];
+        [enc setFragmentBytes:tint length:sizeof tint atIndex:19];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        CHECK(cb.status == MTLCommandBufferStatusCompleted, "prepared motion GPU draw completes");
+        expect_rgba(&color, 0, 255, 0);
+        _Float16 pixels[32];
+        [vectors getBytes:pixels bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+        for (unsigned i = 0; i < 32; i++) CHECK(pixels[i] == 65504, "prepared motion variants retain invalid-history sentinel output");
+    }
     early_reset(); CHECK(!early_inputs.count && !early_inflight, "reset joins worker and clears input snapshots");
     early_targets = nil; early_recipes = nil; early_group = nil; early_queue = nil;
 
@@ -1752,10 +1836,26 @@ static void shader_preparation(void) {
     setenv("LARECOMP_SHADER_RECORD", "recipes.jsonl", 1);
     NvnTexture color = test_texture(1, 4, 4, 1, 1, 0x25, 1);
     bind_targets(&color, NULL, NULL); prepare_draw();
-    ShaderKey ordinary_key={0}, motion_key={.fg_motion=1};
-    CHECK(prep_program_record(st.program,&motion_key,&ordinary_key)==nil &&
-          prep_program_record(st.program,&ordinary_key,&motion_key)==nil,
-          "runtime motion variants cannot alias ordinary shaders in the shared recipe cache");
+    ShaderKey ordinary_key = {0}, motion_key = {.fg_motion = 1}, invalidating_key = {.fg_motion = 2};
+    NSDictionary *ordinary_record = prep_program_record(st.program, &ordinary_key, &ordinary_key);
+    NSDictionary *motion_record = prep_program_record(st.program, &motion_key, &motion_key);
+    NSDictionary *invalidating_record = prep_program_record(st.program, &ordinary_key, &invalidating_key);
+    CHECK(motion_record && invalidating_record &&
+          ![prep_program_id(ordinary_record) isEqual:prep_program_id(motion_record)] &&
+          ![prep_program_id(ordinary_record) isEqual:prep_program_id(invalidating_record)] &&
+          ![prep_program_id(motion_record) isEqual:prep_program_id(invalidating_record)],
+          "ordinary, history and motion-invalidation recipes have separate identities");
+    for (unsigned mode = 0; mode <= 2; mode++) {
+        ShaderKey key = {.fg_motion = mode}, decoded = {0};
+        CHECK(prep_key_parse(prep_key_dict(&key), &decoded) && decoded.fg_motion == mode,
+              "optional motion specialization roundtrips without changing old keys");
+    }
+    NSMutableDictionary *bad_motion = [prep_key_dict(&ordinary_key) mutableCopy];
+    bad_motion[@"fg_motion"] = @3;
+    CHECK(!prep_key_parse(bad_motion, &decoded), "unknown motion modes are rejected");
+    bad_motion[@"fg_motion"] = @0;
+    CHECK(prep_key_parse(bad_motion, &decoded) && [prep_key_dict(&decoded) isEqual:prep_key_dict(&ordinary_key)],
+          "an explicit ordinary motion value normalizes to the legacy identity");
     NSMutableDictionary *shaders = [NSMutableDictionary new];
     for (int i = 0; i < 2; i++) {
         NvnShaderStage *stage = &st.program->stages[i];
@@ -2802,6 +2902,7 @@ static const struct { const char *name, *group; TestFn run; bool needs_sampler26
     {"gpu-indirect-arrays", "draws", gpu_indirect_arrays},
     {"gpu-indirect-indexed", "draws", gpu_indirect_indexed},
     {"raster-discard-restore", "draws", raster_discard_restore},
+    {"sampler-capability", "samplers", sampler_capability},
     {"sampler-reduction", "samplers", sampler_reduction, true},
     {"sampler-border", "samplers", sampler_border},
     {"sampler-bias", "samplers", sampler_bias, true},
@@ -2830,14 +2931,15 @@ int metal_renderer_test_main(int argc, char **argv) { @autoreleasepool {
     setenv("LARECOMP_NO_SHADER_WARM", "1", 1);
     char temporary[] = "/tmp/pokeza-metal-tests-XXXXXX";
     CHECK(mkdtemp(temporary) && chdir(temporary) == 0, "test working directory");
+    CHECK(setenv("LARECOMP_DATA_ROOT", temporary, 1) == 0, "test data root");
     metal_test_bootstrap();
     if (!dev) { fprintf(stderr, "SKIP: no Metal device\n"); return 77; }
     const char *selection = argc > 1 ? argv[1] : "all";
     unsigned ran = 0, skipped = 0;
     for (unsigned i = 0; i < sizeof tests / sizeof *tests; i++) {
         if (strcmp(selection, "all") && strcmp(selection, tests[i].name) && strcmp(selection, tests[i].group)) continue;
-        if (tests[i].needs_sampler26 && !native_sampler_available()) {
-            fprintf(stderr, "SKIP %s: requires macOS 26 and SDK 26\n", tests[i].name); skipped++; continue;
+        if (tests[i].needs_sampler26 && !native_sampler_features_available()) {
+            fprintf(stderr, "SKIP %s: requires Apple10 hardware, macOS 26 and SDK 26\n", tests[i].name); skipped++; continue;
         }
         fprintf(stderr, "RUN %s\n", tests[i].name);
         tests[i].run(); check_gpu(); renderer_reset(); ran++;
@@ -2850,6 +2952,6 @@ int metal_renderer_test_main(int argc, char **argv) { @autoreleasepool {
     CHECK(g_archive_dirty == 0, "the pipeline archive must save with every pipeline the cases built");
     [[NSFileManager defaultManager] removeItemAtPath:@(temporary) error:nil];
     if (ran) fprintf(stderr, "PASS: %u Metal renderer tests on %s\n", ran, dev.name.UTF8String);
-    if (skipped) fprintf(stderr, "SKIP: %u tests requiring newer sampler APIs\n", skipped);
+    if (skipped) fprintf(stderr, "SKIP: %u tests requiring native sampler feature support\n", skipped);
     return ran ? 0 : 77;
 }}

@@ -60,7 +60,7 @@ void metal_test_texture_dump(void) {
 
 void metal_test_bootstrap(void) {
     // runtime/main.o's constructor has already reserved the guest window, even with our alternate entry point.
-    uint64_t address = 0x7200000000ull;
+    uint64_t address = HEAP_BASE;  // the alias reservation can move on newer macOS releases
     dev = MTLCreateSystemDefaultDevice();
     if (!dev) return;
     queue = [dev newCommandQueue];
@@ -80,6 +80,54 @@ void metal_test_bootstrap(void) {
 // Advance only the upload-cache frame for ownership regressions; no window or fake renderer is needed.
 void metal_test_next_texture_frame(void) { g_frame_counter++; }
 
+static void check_smaa_metrics(id<MTLTexture> input) {
+    // A size-specialized reference must produce the same pixels as runtime metrics.
+    NSString *metrics = [NSString stringWithFormat:@"#define SMAA_RT_METRICS float4(%.9g, %.9g, %.1f, %.1f)",
+                         1.0 / input.width, 1.0 / input.height, (double)input.width, (double)input.height];
+    NSString *reference = [smaa_msl() stringByReplacingOccurrencesOfString:@"#define SMAA_RT_METRICS metrics" withString:metrics];
+    NSError *error = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:reference options:nil error:&error];
+    assert(lib && !error);
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"smaa_vs"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> reference_pipelines[3];
+    const char *names[] = {"smaa_edge", "smaa_weight", "smaa_blend"};
+    for (unsigned i = 0; i < 3; i++) {
+        pd.fragmentFunction = [lib newFunctionWithName:@(names[i])];
+        reference_pipelines[i] = [dev newRenderPipelineStateWithDescriptor:pd error:&error];
+        assert(reference_pipelines[i] && !error);
+    }
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    PresentEffects *effects = [PresentEffects new];
+    id<MTLTexture> actual = smaa_encode(cb, input, effects);
+    id<MTLTexture> edges = smaa_target(nil, input.width, input.height, MTLPixelFormatRGBA8Unorm);
+    id<MTLTexture> weights = smaa_target(nil, input.width, input.height, MTLPixelFormatRGBA8Unorm);
+    id<MTLTexture> expected = smaa_target(nil, input.width, input.height, MTLPixelFormatRGBA8Unorm);
+    // smaa_encode has uploaded the immutable area/search tables; bind the same tables again.
+    extern const unsigned char *smaa_area_tex(void), *smaa_search_tex(void);
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm width:160 height:560 mipmapped:NO];
+    id<MTLTexture> area = [dev newTextureWithDescriptor:d];
+    [area replaceRegion:MTLRegionMake2D(0, 0, 160, 560) mipmapLevel:0 withBytes:smaa_area_tex() bytesPerRow:320];
+    d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:64 height:16 mipmapped:NO];
+    id<MTLTexture> search = [dev newTextureWithDescriptor:d];
+    [search replaceRegion:MTLRegionMake2D(0, 0, 64, 16) mipmapLevel:0 withBytes:smaa_search_tex() bytesPerRow:64];
+    smaa_pass(cb, reference_pipelines[0], edges, true, input, nil, nil);
+    smaa_pass(cb, reference_pipelines[1], weights, true, edges, area, search);
+    smaa_pass(cb, reference_pipelines[2], expected, false, input, weights, nil);
+    NSUInteger row = (input.width * 4 + 255) & ~255ul, length = row * input.height;
+    id<MTLBuffer> a = [dev newBufferWithLength:length options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b = [dev newBufferWithLength:length options:MTLResourceStorageModeShared];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    for (unsigned i = 0; i < 2; i++)
+        [blit copyFromTexture:i ? expected : actual sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                  sourceSize:MTLSizeMake(input.width, input.height, 1) toBuffer:i ? b : a destinationOffset:0
+                  destinationBytesPerRow:row destinationBytesPerImage:length];
+    [blit endEncoding]; [cb commit]; [cb waitUntilCompleted]; assert(!cb.error);
+    for (NSUInteger y = 0; y < input.height; y++) for (NSUInteger x = 0; x < input.width * 4; x++)
+        assert(abs(((uint8_t *)a.contents)[y * row + x] - ((uint8_t *)b.contents)[y * row + x]) <= 1);
+}
+
 void metal_test_frame_generation_filters(void) {
     int old_aa=g_settings.antialias,old_upscale=g_settings.upscaler;
     g_settings.antialias=AA_SMAA;g_settings.upscaler=UPSCALE_METALFX;
@@ -88,7 +136,10 @@ void metal_test_frame_generation_filters(void) {
         unsigned w=i?128:256,h=i?96:192;
         MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
         d.usage=MTLTextureUsageShaderRead;inputs[i]=[dev newTextureWithDescriptor:d];
-        uint8_t *pixels=calloc(w*h,4);memset(pixels,127,w*h*4);
+        uint8_t *pixels=calloc(w*h,4);
+        for (unsigned y=0;y<h;y++) for (unsigned x=0;x<w;x++) {
+            uint8_t *p=pixels+4*(y*w+x);p[0]=p[1]=p[2]=(x+2*y)%w<w/2?32:224;p[3]=255;
+        }
         [inputs[i] replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0 withBytes:pixels bytesPerRow:w*4];free(pixels);
     }
     id<MTLRenderPipelineState> pipelines[2]={nil,nil};id<MTLFXSpatialScaler> scalers[2]={nil,nil};
@@ -104,6 +155,23 @@ void metal_test_frame_generation_filters(void) {
         }
         assert(outputs[0]!=outputs[1]);[cb commit];[cb waitUntilCompleted];assert(!cb.error);
     }
+    for (unsigned size=0;size<3;size++) {
+        id<MTLCommandBuffer> cb=[queue commandBuffer];
+        id<MTLTexture> input=inputs[size==1];
+        assert(present_postprocess(cb,input,320,240,false));
+        assert(present_effects(false)->pe==pipelines[0]);
+        [cb commit];[cb waitUntilCompleted];assert(!cb.error);
+    }
+    PresentEffects *effects=present_effects(false);
+    id<MTLFXSpatialScaler> scaler=effects->fx;
+    effects->fx_out=nil;  // the cached state left by a failed output allocation
+    effects->fx_retry_after=CACurrentMediaTime()+60;
+    assert(!metalfx_upscale(nil,inputs[0],320,240,effects));
+    assert(effects->fx==scaler && !effects->fx_out);
+    effects->fx_retry_after=0;
+    assert(metalfx_upscale(nil,inputs[0],320,240,effects));
+    assert(effects->fx==scaler);
+    for (unsigned i=0;i<2;i++)check_smaa_metrics(inputs[i]);
     g_settings.antialias=old_aa;g_settings.upscaler=old_upscale;
 }
 

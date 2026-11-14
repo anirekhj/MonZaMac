@@ -58,28 +58,40 @@ void ts_camera_jitter(float m[96],const float j[2],float width,float height,bool
 
 @interface TsFrame:NSObject {
 @public
-    id<MTLTexture> color,depth,motion,scaled,composite;
+    id<MTLTexture> color,depth,motion,scaled,composite,reactive;
     unsigned readers;
 }
 @end
 @implementation TsFrame
+@end
+@interface TsPrograms:NSObject {
+@public
+    id<MTLDevice> device;
+    id<MTLComputePipelineState> prepare_float,prepare_depth,compose,reactivity;
+}
+@end
+@implementation TsPrograms
 @end
 @interface TsState:NSObject {
 @public
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLFXTemporalScaler> effect;
-    id<MTLComputePipelineState> prepare_float,prepare_depth,compose;
+    TsPrograms *programs;
     NSMutableArray<TsFrame *> *ring;
+    TsFrame *previous_frame;
     unsigned iw,ih,ow,oh;
+    unsigned previous_width,previous_height;
+    vector_float2 previous_jitter;
     FgCamera previous;
     uint64_t last;
-    bool valid;
+    bool valid,dynamic,reactive,dynamic_request,reactive_request;
 }
 @end
 @implementation TsState
 @end
 static TsState *state;
+static NSMutableArray<TsPrograms *> *program_cache;
 void ts_reset(void){@synchronized([TsState class]){state=nil;input_frame=UINT64_MAX;raster_active=false;}}
 
 static NSString *const source=@
@@ -87,13 +99,16 @@ static NSString *const source=@
 "float3 linear_rgb(float3 c){return select(c/12.92f,pow((c+.055f)/1.055f,float3(2.4f)),c>.04045f); }\n"
 "struct P { float4x4 inverse,previous; uint4 rect; float2 jitter; uint has_geometry; };\n"
 "void prepare(float z,uint2 p,constant P& c,texture2d<float> scene,texture2d<half,access::read> geometry,texture2d<half,access::write> color,texture2d<float,access::write> depth,texture2d<half,access::write> motion) {\n"
-" float2 size=float2(color.get_width(),color.get_height());float2 uv=(float2(p)+.5)/size;float2 plain=uv-c.jitter/size;\n"
+" float2 size=float2(c.rect.zw);float2 uv=(float2(p)+.5)/size;float2 plain=uv-c.jitter/size;\n"
 " float4 rgb=scene.read(p);color.write(half4(half3(linear_rgb(rgb.rgb)),half(rgb.a)),p);depth.write(float4(z),p);float4 world=c.inverse*float4(plain.x*2-1,1-plain.y*2,z,1);float4 prev=c.previous*world;float2 mv=0;\n"
 " if(all(isfinite(prev))&&prev.w>1e-6){float2 n=prev.xy/prev.w;mv=(float2(n.x*.5+.5,.5-n.y*.5)-plain)*size;}\n"
 " if(c.has_geometry){half2 g=geometry.read(c.rect.xy+p).xy;if(all((as_type<ushort2>(g)&ushort2(0x7fff))<ushort2(0x7bff)))mv=float2(g);}\n"
 " if(any((as_type<uint2>(mv)&uint2(0x7fffffff))>=uint2(0x7f800000)))mv=0;mv=clamp(mv,-size,size);motion.write(half4(half2(mv),0,0),p);}\n"
-"kernel void float_input(texture2d<float> scene[[texture(0)]],texture2d<float> z[[texture(1)]],texture2d<half,access::read> geometry[[texture(2)]],texture2d<half,access::write> color[[texture(3)]],texture2d<float,access::write> depth[[texture(4)]],texture2d<half,access::write> motion[[texture(5)]],constant P& c[[buffer(0)]],uint2 p[[thread_position_in_grid]]){if(p.x<color.get_width()&&p.y<color.get_height())prepare(z.read(c.rect.xy+p).x,p,c,scene,geometry,color,depth,motion);}\n"
-"kernel void depth_input(texture2d<float> scene[[texture(0)]],depth2d<float> z[[texture(1)]],texture2d<half,access::read> geometry[[texture(2)]],texture2d<half,access::write> color[[texture(3)]],texture2d<float,access::write> depth[[texture(4)]],texture2d<half,access::write> motion[[texture(5)]],constant P& c[[buffer(0)]],uint2 p[[thread_position_in_grid]]){constexpr sampler q(coord::pixel,filter::nearest);if(p.x<color.get_width()&&p.y<color.get_height())prepare(z.sample(q,float2(c.rect.xy+p)+.5),p,c,scene,geometry,color,depth,motion);}\n"
+"kernel void float_input(texture2d<float> scene[[texture(0)]],texture2d<float> z[[texture(1)]],texture2d<half,access::read> geometry[[texture(2)]],texture2d<half,access::write> color[[texture(3)]],texture2d<float,access::write> depth[[texture(4)]],texture2d<half,access::write> motion[[texture(5)]],constant P& c[[buffer(0)]],uint2 p[[thread_position_in_grid]]){if(all(p<c.rect.zw))prepare(z.read(c.rect.xy+p).x,p,c,scene,geometry,color,depth,motion);}\n"
+"kernel void depth_input(texture2d<float> scene[[texture(0)]],depth2d<float> z[[texture(1)]],texture2d<half,access::read> geometry[[texture(2)]],texture2d<half,access::write> color[[texture(3)]],texture2d<float,access::write> depth[[texture(4)]],texture2d<half,access::write> motion[[texture(5)]],constant P& c[[buffer(0)]],uint2 p[[thread_position_in_grid]]){constexpr sampler q(coord::pixel,filter::nearest);if(all(p<c.rect.zw))prepare(z.sample(q,float2(c.rect.xy+p)+.5),p,c,scene,geometry,color,depth,motion);}\n"
+// Opt-in photometric hint only: this does not classify foliage, particles or materials.
+"struct R { float4 size; float4 jitter; uint history; };\n"
+"kernel void reactivity(texture2d<half,access::read> current[[texture(0)]],texture2d<float> previous[[texture(1)]],texture2d<half,access::read> motion[[texture(2)]],texture2d<half,access::write> mask[[texture(3)]],constant R& c[[buffer(0)]],uint2 p[[thread_position_in_grid]]){if(any(p>=uint2(c.size.xy)))return;float value=0;if(c.history){float2 uv=(float2(p)+.5-c.jitter.xy)/c.size.xy+float2(motion.read(p).xy)/c.size.xy;float2 pixel=uv*c.size.zw+c.jitter.zw;if(any(pixel<.5)||any(pixel>c.size.zw-.5))value=1;else{constexpr sampler q(coord::pixel,filter::linear,address::clamp_to_edge);float3 old=previous.sample(q,pixel).rgb;float3 delta=abs(float3(current.read(p).rgb)-old);value=smoothstep(.08f,.25f,max(max(delta.x,delta.y),delta.z));}}mask.write(half4(half(value),0,0,0),p);}\n"
 // Conservative spike-only HUD isolation: differing current-frame pixels use spatial sampling.
 "kernel void composite(texture2d<float> scene[[texture(0)]],texture2d<float> ui[[texture(1)]],texture2d<float> scaled[[texture(2)]],texture2d<half,access::write> out[[texture(3)]],constant uint4& r[[buffer(0)]],uint2 p[[thread_position_in_grid]]){if(p.x>=out.get_width()||p.y>=out.get_height())return;constexpr sampler q(coord::normalized,filter::linear);float2 uv=(float2(p)+.5)/float2(out.get_width(),out.get_height());float4 s=scene.sample(q,uv);float4 u=ui.sample(q,(float2(r.xy)+uv*float2(r.zw))/float2(ui.get_width(),ui.get_height()));float delta=max(max(abs(s.r-u.r),abs(s.g-u.g)),abs(s.b-u.b));out.write(half4(delta>1.f/255.f?float4(linear_rgb(u.rgb),u.a):scaled.read(p)),p);}\n";
 
@@ -101,24 +116,62 @@ static id<MTLTexture> texture(TsState *s,MTLPixelFormat f,unsigned w,unsigned h,
     MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:w height:h mipmapped:NO];
     d.storageMode=MTLStorageModePrivate;d.usage=usage;return [s->device newTextureWithDescriptor:d];
 }
+static TsPrograms *programs(id<MTLDevice> device) {
+    for(TsPrograms *p in program_cache)if(p->device==device)return p;
+    NSError *error=nil;id<MTLLibrary> lib=[device newLibraryWithSource:source options:nil error:&error];
+    if(!lib){devlog("temporal","prepare compiler: %s",error.localizedDescription.UTF8String);return nil;}
+    TsPrograms *p=[TsPrograms new];p->device=device;
+    p->prepare_float=[device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"float_input"] error:&error];
+    p->prepare_depth=[device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"depth_input"] error:&error];
+    p->compose=[device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"composite"] error:&error];
+    p->reactivity=[device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"reactivity"] error:&error];
+    if(!p->prepare_float || !p->prepare_depth || !p->compose || !p->reactivity)return nil;
+    if(!program_cache)program_cache=[NSMutableArray new];[program_cache addObject:p];return p;
+}
+static bool dynamic_input_requested(void) {
+    const char *e=getenv("LARECOMP_TEMPORAL_DYNAMIC_INPUT");
+    return res_is_dynamic(g_settings.res_mode) && (!e || atoi(e));
+}
+static bool reactive_requested(void) {
+    const char *e=getenv("LARECOMP_TEMPORAL_REACTIVE");return e && atoi(e);
+}
 static TsState *make_state(id<MTLCommandBuffer> cb,unsigned iw,unsigned ih,unsigned ow,unsigned oh) {
-    TsState *s=[TsState new];s->device=cb.device;s->queue=cb.commandQueue;s->iw=iw;s->ih=ih;s->ow=ow;s->oh=oh;
+    TsState *s=[TsState new];s->device=cb.device;s->queue=cb.commandQueue;s->ow=ow;s->oh=oh;
+    s->programs=programs(s->device);if(!s->programs)return nil;
     MTLFXTemporalScalerDescriptor *d=[MTLFXTemporalScalerDescriptor new];
-    d.inputWidth=iw;d.inputHeight=ih;d.outputWidth=ow;d.outputHeight=oh;
+    s->dynamic_request=dynamic_input_requested();s->reactive_request=reactive_requested();
+    s->dynamic=s->dynamic_request && [d respondsToSelector:@selector(setInputContentPropertiesEnabled:)];
+    double top=oh;
+    if(g_settings.res_mode==RES_DYNAMIC_X1 || g_settings.res_mode==RES_DYNAMIC_X15)
+        top=fmin(top,(g_settings.handheld?720.:1080.)*(g_settings.res_mode==RES_DYNAMIC_X15?1.5:1));
+    double capacity=s->dynamic?fmax(1,fmin((double)ow/iw,top/ih)):1;
+    s->iw=(unsigned)llround(iw*capacity);s->ih=(unsigned)llround(ih*capacity);
+    d.inputWidth=s->iw;d.inputHeight=s->ih;d.outputWidth=ow;d.outputHeight=oh;
     d.colorTextureFormat=d.outputTextureFormat=MTLPixelFormatRGBA16Float;
     d.depthTextureFormat=MTLPixelFormatR32Float;d.motionTextureFormat=MTLPixelFormatRG16Float;d.autoExposureEnabled=YES;
-    s->effect=[d newTemporalScalerWithDevice:s->device];if(!s->effect)return nil;
-    NSError *error=nil;id<MTLLibrary> lib=[s->device newLibraryWithSource:source options:nil error:&error];
-    if(!lib){devlog("temporal","prepare compiler: %s",error.localizedDescription.UTF8String);return nil;}
-    s->prepare_float=[s->device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"float_input"] error:&error];
-    s->prepare_depth=[s->device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"depth_input"] error:&error];
-    s->compose=[s->device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"composite"] error:&error];
-    if(!s->prepare_float || !s->prepare_depth || !s->compose)return nil;
+    if(s->dynamic){d.inputContentPropertiesEnabled=YES;d.inputContentMinScale=min_scale;d.inputContentMaxScale=max_scale;}
+    if(@available(macOS 14.4,*)) {
+        s->reactive=s->reactive_request;
+        if(s->reactive){d.reactiveMaskTextureEnabled=YES;d.reactiveMaskTextureFormat=MTLPixelFormatR8Unorm;}
+    }
+    s->effect=[d newTemporalScalerWithDevice:s->device];
+    if(!s->effect && s->reactive){
+        // An optional mask must not prevent ordinary reconstruction on a device that rejects it.
+        s->reactive=false;
+        if(@available(macOS 14.4,*))d.reactiveMaskTextureEnabled=NO;
+        s->effect=[d newTemporalScalerWithDevice:s->device];
+    }
+    if(!s->effect && s->dynamic){
+        // A device may reject the dynamic range even though fixed-size reconstruction works.
+        s->dynamic=false;s->iw=iw;s->ih=ih;d.inputContentPropertiesEnabled=NO;d.inputWidth=iw;d.inputHeight=ih;
+        s->effect=[d newTemporalScalerWithDevice:s->device];
+    }
+    if(!s->effect)return nil;
     s->ring=[NSMutableArray new];return s;
 }
 static TsFrame *acquire(TsState *s) {
     @synchronized([TsState class]){
-        for(TsFrame *f in s->ring)if(!f->readers){f->readers++;return f;}
+        for(TsFrame *f in s->ring)if(!f->readers && (!s->reactive || f!=s->previous_frame)){f->readers++;return f;}
         if(s->ring.count>=6)return nil;
         TsFrame *f=[TsFrame new];
         f->color=texture(s,MTLPixelFormatRGBA16Float,s->iw,s->ih,s->effect.colorTextureUsage|MTLTextureUsageShaderWrite);
@@ -126,7 +179,8 @@ static TsFrame *acquire(TsState *s) {
         f->motion=texture(s,MTLPixelFormatRG16Float,s->iw,s->ih,s->effect.motionTextureUsage|MTLTextureUsageShaderWrite);
         f->scaled=texture(s,MTLPixelFormatRGBA16Float,s->ow,s->oh,s->effect.outputTextureUsage|MTLTextureUsageShaderRead);
         f->composite=texture(s,MTLPixelFormatRGBA16Float,s->ow,s->oh,MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
-        if(!f->color || !f->depth || !f->motion || !f->scaled || !f->composite)return nil;
+        if(s->reactive)f->reactive=texture(s,MTLPixelFormatR8Unorm,s->iw,s->ih,MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
+        if(!f->color || !f->depth || !f->motion || !f->scaled || !f->composite || (s->reactive && !f->reactive))return nil;
         f->readers=1;[s->ring addObject:f];return f;
     }
 }
@@ -164,7 +218,10 @@ id<MTLTexture> ts_encode(id<MTLCommandBuffer> cb,id<MTLTexture> scene,id<MTLText
        !isfinite(camera->aspect) || camera->aspect<=0 ||
        !isfinite(camera->near_plane) || !isfinite(camera->far_plane) || camera->near_plane<=0 || camera->far_plane<=camera->near_plane){ts_reset();return nil;}
     TsState *s=state;
-    if(!s || s->device!=cb.device || s->queue!=cb.commandQueue || s->iw!=scene.width || s->ih!=scene.height || s->ow!=width || s->oh!=height)
+    if(!s || s->device!=cb.device || s->queue!=cb.commandQueue || s->ow!=width || s->oh!=height ||
+       s->dynamic_request!=dynamic_input_requested() || s->reactive_request!=reactive_requested() ||
+       (s->dynamic?(scene.width>s->iw || scene.height>s->ih || fabs((double)scene.width*s->ih-(double)scene.height*s->iw)>MAX(s->iw,s->ih)):
+                    (s->iw!=scene.width || s->ih!=scene.height)))
         state=s=make_state(cb,(unsigned)scene.width,(unsigned)scene.height,width,height);
     if(!s)return nil;
     TsFrame *f=acquire(s);if(!f){s->valid=false;return nil;}
@@ -176,22 +233,36 @@ id<MTLTexture> ts_encode(id<MTLCommandBuffer> cb,id<MTLTexture> scene,id<MTLText
     p.has_geometry=geometry && geometry.width==depth.width && geometry.height==depth.height && geometry.pixelFormat==MTLPixelFormatRG16Float;
     id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
     bool native=depth.pixelFormat==MTLPixelFormatDepth16Unorm || depth.pixelFormat==MTLPixelFormatDepth32Float || depth.pixelFormat==MTLPixelFormatDepth32Float_Stencil8;
-    [e setComputePipelineState:native?s->prepare_depth:s->prepare_float];
+    [e setComputePipelineState:native?s->programs->prepare_depth:s->programs->prepare_float];
     [e setTexture:scene atIndex:0];[e setTexture:depth atIndex:1];[e setTexture:p.has_geometry?geometry:scene atIndex:2];
     [e setTexture:f->color atIndex:3];[e setTexture:f->depth atIndex:4];[e setTexture:f->motion atIndex:5];
-    [e setBytes:&p length:sizeof p atIndex:0];[e dispatchThreads:MTLSizeMake(s->iw,s->ih,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[e endEncoding];
+    [e setBytes:&p length:sizeof p atIndex:0];[e dispatchThreads:MTLSizeMake(scene.width,scene.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+    TsFrame *previous=s->reactive && !reset?s->previous_frame:nil;
+    if(s->reactive){
+        [e memoryBarrierWithScope:MTLBarrierScopeTextures];
+        struct {vector_float4 size,jitter;uint32_t history;} r={
+            .size={(float)scene.width,(float)scene.height,(float)s->previous_width,(float)s->previous_height},
+            .jitter={p.jitter.x,p.jitter.y,s->previous_jitter.x,s->previous_jitter.y},.history=previous!=nil};
+        [e setComputePipelineState:s->programs->reactivity];[e setTexture:f->color atIndex:0];
+        [e setTexture:previous?previous->color:f->color atIndex:1];[e setTexture:f->motion atIndex:2];[e setTexture:f->reactive atIndex:3];
+        [e setBytes:&r length:sizeof r atIndex:0];[e dispatchThreads:MTLSizeMake(scene.width,scene.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+    }
+    [e endEncoding];
     id<MTLFXTemporalScaler> effect=s->effect;
     effect.colorTexture=f->color;effect.depthTexture=f->depth;effect.motionTexture=f->motion;effect.outputTexture=f->scaled;
-    effect.inputContentWidth=s->iw;effect.inputContentHeight=s->ih;effect.reset=reset;effect.depthReversed=camera->reversed_depth;
+    effect.inputContentWidth=scene.width;effect.inputContentHeight=scene.height;effect.reset=reset;effect.depthReversed=camera->reversed_depth;
+    if(s->reactive)effect.reactiveMaskTexture=f->reactive;
     effect.preExposure=1;effect.motionVectorScaleX=effect.motionVectorScaleY=1;effect.jitterOffsetX=p.jitter.x;effect.jitterOffsetY=p.jitter.y;
     [effect encodeToCommandBuffer:cb];
-    e=[cb computeCommandEncoder];[e setComputePipelineState:s->compose];
+    e=[cb computeCommandEncoder];[e setComputePipelineState:s->programs->compose];
     [e setTexture:scene atIndex:0];[e setTexture:ui atIndex:1];[e setTexture:f->scaled atIndex:2];[e setTexture:f->composite atIndex:3];
     [e setBytes:&p.rect length:sizeof p.rect atIndex:0];[e dispatchThreads:MTLSizeMake(width,height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[e endEncoding];
     s->last=frame;s->previous=*camera;s->valid=true;input_frame=frame;
+    s->previous_width=(unsigned)scene.width;s->previous_height=(unsigned)scene.height;s->previous_jitter=p.jitter;s->previous_frame=f;
+    if(previous)previous->readers++;
     NSArray *inputs=@[scene,depth,ui,geometry?:scene];
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> done){(void)inputs;@synchronized([TsState class]){f->readers--;if(done.error && state==s)ts_reset();}}];
-    if(frame%120==0)devlog("temporal","frame %llu %ux%u -> %ux%u geometry %u reset %d jitter %.3f,%.3f",(unsigned long long)frame,s->iw,s->ih,width,height,p.has_geometry,reset,p.jitter.x,p.jitter.y);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done){(void)inputs;@synchronized([TsState class]){f->readers--;if(previous)previous->readers--;if(done.error && state==s)ts_reset();}}];
+    if(frame%120==0)devlog("temporal","frame %llu %lux%lu -> %ux%u capacity %ux%u dynamic %d reactive %d geometry %u reset %d jitter %.3f,%.3f",(unsigned long long)frame,(unsigned long)scene.width,(unsigned long)scene.height,width,height,s->iw,s->ih,s->dynamic,s->reactive,p.has_geometry,reset,p.jitter.x,p.jitter.y);
     if(output){
         output->scene=f->scaled;output->composited=f->composite;
         output->prepared=(FgPreparedInputs){.depth=f->depth,.motion=f->motion,.scaler=s->effect,.reset=reset};

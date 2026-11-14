@@ -55,6 +55,16 @@ typedef struct {
 id<MTLTexture> fg_encode_prepared(id<MTLCommandBuffer> command_buffer,
     id<MTLTexture> scene, id<MTLTexture> composited_ui, const FgPreparedInputs *inputs,
     const FgCamera *camera, int mode, double now_seconds);
+// Opt-in pooled outputs: all reads/copies must be encoded in command_buffer.
+// The image may be overwritten after that command buffer completes, even if retained.
+// When every output slot is in flight these return nil, preserving the real-frame path.
+id<MTLTexture> fg_encode_view_reusing_output(id<MTLCommandBuffer> command_buffer,
+    id<MTLTexture> scene, id<MTLTexture> composited_ui, const FgRect *ui_rect,
+    id<MTLTexture> depth, const FgRect *depth_rect, id<MTLTexture> geometry_motion,
+    const FgCamera *camera, int mode, unsigned max_width, double now_seconds);
+id<MTLTexture> fg_encode_prepared_reusing_output(id<MTLCommandBuffer> command_buffer,
+    id<MTLTexture> scene, id<MTLTexture> composited_ui, const FgPreparedInputs *inputs,
+    const FgCamera *camera, int mode, double now_seconds);
 id<MTLTexture> fg_encode(id<MTLCommandBuffer> command_buffer,
                          id<MTLTexture> scene, id<MTLTexture> composited_ui,
                          id<MTLTexture> depth, id<MTLTexture> geometry_motion, const FgCamera *camera,

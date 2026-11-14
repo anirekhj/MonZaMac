@@ -9,6 +9,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = r'''
 #include "runtime/settings.h"
+#include "runtime/ui/i18n.h"
 #include "runtime/rt.h"
 #include <assert.h>
 #include <stdlib.h>
@@ -23,6 +24,11 @@ bool fg_supported(void) { return supported; }
 bool temporal_supported(void) { return false; }
 uint64_t plat_now_ns(void) { return now; }
 void rt_za_npc_capacity(void) {}
+int g_nmodules = 2;
+const char *const ui_language_codes[UI_LANGUAGE_COUNT] = {
+    "auto", "en", "it", "fr", "es", "de", "pt-BR", "ja", "zh-Hans", "zh-Hant", "ko", "ru"
+};
+int ui_auto_language(void) { return UI_LANG_EN; }
 bool bind_settings_load(const char *key, const char *val) { return false; }
 void bind_settings_save(FILE *f) {}
 extern int32_t rt_za_frame_cfg(int32_t cfg);

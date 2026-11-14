@@ -15,6 +15,7 @@ void ts_camera_jitter(float matrices[96], const float jitter[2], float width, fl
 #ifdef __OBJC__
 // Returned images are linear RGBA16F; presentation must encode sRGB.
 // Prepared fields are valid for this command buffer; FG copies previous color before recycling.
+// Dynamic modes retain maximum-size depth/motion textures; the linked scaler carries their current content extent.
 typedef struct {
     id<MTLTexture> scene, composited;
     FgPreparedInputs prepared;

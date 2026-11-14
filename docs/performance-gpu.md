@@ -256,3 +256,27 @@ small, as long as the checks hold.
 - [Apple: Monitoring Metal graphics performance](https://developer.apple.com/documentation/xcode/monitoring-your-metal-apps-graphics-performance)
 - [Apple: Customizing the Metal Performance HUD](https://developer.apple.com/documentation/xcode/customizing-metal-performance-hud)
 - [Apple: Generating Metal HUD performance reports](https://developer.apple.com/documentation/xcode/generating-performance-reports-with-metal-performance-hud)
+
+## Presentation-filter follow-up
+
+SMAA now passes render-target metrics as fragment uniforms through a thread-local helper instead of embedding
+dimensions in the Metal source. Resolution changes resize its targets without rebuilding its library or pipelines;
+real and generated frames retain separate targets. The native filter regression compares runtime metrics against
+size-specialized reference pixels at two resolutions and checks pipeline reuse through an A/B/A size sequence.
+
+Spatial MetalFX also retries a missing output allocation after a bounded delay, rather than leaving a partially
+initialized cache disabled until the next resize. Reusing a valid scaler avoids repeating its initialization during
+recovery. The regression checks the missing-output state, retry cooldown and recovery without a size change.
+
+Frame interpolation uses bounded, producer-command-buffer output reuse in ordinary presentation. Developer image
+captures retain the immutable-output API because their readback happens in another command buffer. Final window
+images remain separately owned by the display queue; they are not recycled at producer completion.
+
+Native sampler minimum/maximum reduction and descriptor LOD bias require both macOS 26 APIs and an Apple10 GPU
+family device. Earlier Apple Silicon uses the existing averaging/zero-bias fallback instead of creating an
+unsupported descriptor. This prevents a device-validation failure; it does not emulate those sampler semantics.
+The native sampler tests check exact semantics only on capable hardware and verify the fallback on earlier GPUs.
+See [Apple's Metal feature tables](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf).
+
+These changes remove repeated setup/allocation work. No in-game FPS improvement is claimed without a matched
+scene replay; native pixel, cache and resource-lifetime checks do not substitute for that measurement.

@@ -219,7 +219,89 @@ static void geometry_motion_test(int mode) {
 #endif
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
 API_AVAILABLE(macos(26.0))
-static void prepared_temporal_test(int mode) {
+static void pooled_output_test(int mode) {
+    fg_reset();double now=80,dt=1./(mode==1?30:60);
+    id<MTLTexture> z=depth(false,false);
+    NSMutableArray<id<MTLTexture>> *seen=[NSMutableArray new];
+    // Completed output slots are reused; retaining an output is deliberately not a lease.
+    for(int i=0;i<10;i++) {
+        FgCamera c=camera(i*16.f/(W*(1.f/tanf(M_PI/6)/((float)W/H))),false);
+        id<MTLCommandBuffer> cb=[queue commandBuffer];
+        id<MTLTexture> out=fg_encode_view_reusing_output(cb,scene(i*4,false),nil,NULL,z,NULL,nil,&c,mode,0,now+i*dt);
+        if(i<2)assert(!out);else {assert(out);if(![seen containsObject:out])[seen addObject:out];}
+        [cb commit];[cb waitUntilCompleted];assert(!cb.error);
+    }
+    assert(seen.count==1 && state->outputs.count==1);
+
+    // Hold an entire pool before commit: no in-flight result can be overwritten.
+    fg_reset();NSMutableArray<id<MTLCommandBuffer>> *pending=[NSMutableArray new];
+    NSMutableArray<id<MTLBuffer>> *copies=[NSMutableArray new];
+    NSMutableArray<id<MTLTexture>> *outputs=[NSMutableArray new];
+    for(unsigned i=0;i<FG_OUTPUT_POOL_LIMIT;i++) {
+        FgCamera c=camera(i*16.f/(W*(1.f/tanf(M_PI/6)/((float)W/H))),false);
+        id<MTLCommandBuffer> cb=[queue commandBuffer];
+        id<MTLTexture> out=fg_encode_view_reusing_output(cb,scene(i*4,false),nil,NULL,z,NULL,nil,&c,mode,0,now+i*dt);
+        if(i<2)assert(!out);else {
+            assert(out && ![outputs containsObject:out]);[outputs addObject:out];
+            id<MTLBuffer> copy=[device newBufferWithLength:W*H*4 options:MTLResourceStorageModeShared];
+            id<MTLBlitCommandEncoder> blit=[cb blitCommandEncoder];
+            [blit copyFromTexture:out sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                      sourceSize:MTLSizeMake(W,H,1) toBuffer:copy destinationOffset:0
+           destinationBytesPerRow:W*4 destinationBytesPerImage:W*H*4];[blit endEncoding];
+            [copies addObject:copy];
+        }
+        [pending addObject:cb];
+    }
+    assert(state->outputs.count==FG_OUTPUT_POOL_LIMIT);
+    FgState *generation=state;FgCamera c=camera(0,false);
+    id<MTLCommandBuffer> extra=[queue commandBuffer];
+    assert(!fg_encode_view_reusing_output(extra,scene(0,false),nil,NULL,z,NULL,nil,&c,mode,0,now+FG_OUTPUT_POOL_LIMIT*dt));
+    assert(state==generation && !state->previous && state->outputs.count==FG_OUTPUT_POOL_LIMIT);
+    // Old-generation callbacks must only release their own slots after reset.
+    fg_reset();
+    id<MTLCommandBuffer> next=[queue commandBuffer];
+    assert(!fg_encode_view_reusing_output(next,scene(0,false),nil,NULL,z,NULL,nil,&c,mode,0,now+1));
+    FgState *replacement=state;assert(replacement && replacement!=generation);
+    for(id<MTLCommandBuffer> cb in pending)[cb commit];
+    [extra commit];[next commit];
+    for(id<MTLCommandBuffer> cb in pending){[cb waitUntilCompleted];assert(!cb.error);}
+    [extra waitUntilCompleted];[next waitUntilCompleted];assert(!extra.error && !next.error && state==replacement);
+    for(unsigned i=0;i<copies.count;i++) {
+        const uint8_t *pixels=copies[i].contents;
+        NSMutableData *converted=[NSMutableData dataWithLength:W*H*8];__fp16 *v=converted.mutableBytes;
+        for(unsigned k=0;k<W*H*4;k++)v[k]=(__fp16)(pixels[k]/255.f);
+        assert_midpoint(converted,(i+2)*4,mode,false,false);
+    }
+    for(FgOutput *o in generation->outputs)assert(!o->busy);
+    assert(replacement->outputs.count==1);
+    fg_reset();
+}
+API_AVAILABLE(macos(26.0))
+static void pooled_output_recovery_test(int mode) {
+    fg_reset();id<MTLTexture> z=depth(false,false);FgCamera c=camera(0,false);
+    NSMutableArray<id<MTLCommandBuffer>> *pending=[NSMutableArray new];double now=90,dt=1./(mode==1?30:60);
+    for(unsigned i=0;i<FG_OUTPUT_POOL_LIMIT;i++) {
+        id<MTLCommandBuffer> cb=[queue commandBuffer];
+        id<MTLTexture> out=fg_encode_view_reusing_output(cb,scene(0,false),nil,NULL,z,NULL,nil,&c,mode,0,now+i*dt);
+        assert((out!=nil)==(i>=2));[pending addObject:cb];
+    }
+    FgState *generation=state;id<MTLCommandBuffer> extra=[queue commandBuffer];
+    assert(!fg_encode_view_reusing_output(extra,scene(0,false),nil,NULL,z,NULL,nil,&c,mode,0,now+FG_OUTPUT_POOL_LIMIT*dt));
+    assert(state==generation && !state->previous);
+    for(id<MTLCommandBuffer> cb in pending)[cb commit];[extra commit];
+    for(id<MTLCommandBuffer> cb in pending){[cb waitUntilCompleted];assert(!cb.error);}[extra waitUntilCompleted];assert(!extra.error);
+    // Motion in these new frames has no link to the last accepted color. Both
+    // seed frames must be suppressed instead of presenting mismatched history.
+    for(unsigned i=0;i<3;i++) {
+        id<MTLCommandBuffer> cb=[queue commandBuffer];
+        id<MTLTexture> out=fg_encode_view_reusing_output(cb,scene(20,false),nil,NULL,z,NULL,nil,&c,mode,0,now+(FG_OUTPUT_POOL_LIMIT+i)*dt);
+        assert((out!=nil)==(i>=2));assert(state==generation && state->outputs.count==FG_OUTPUT_POOL_LIMIT);
+        [cb commit];[cb waitUntilCompleted];assert(!cb.error);
+    }
+    fg_reset();
+}
+API_AVAILABLE(macos(26.0))
+static void prepared_temporal_test(int mode,bool reuse_output) {
     fg_reset();unsigned ow=W*3/2,oh=H*3/2;
     MTLFXTemporalScalerDescriptor *d=[MTLFXTemporalScalerDescriptor new];
     d.inputWidth=W;d.inputHeight=H;d.outputWidth=ow;d.outputHeight=oh;
@@ -242,12 +324,14 @@ static void prepared_temporal_test(int mode) {
         scaler.motionVectorScaleX=scaler.motionVectorScaleY=1;
         [scaler encodeToCommandBuffer:cb];
         FgPreparedInputs inputs={.depth=z,.motion=motion,.scaler=scaler,.reset=i==0};
-        generated=fg_encode_prepared(cb,real,nil,&inputs,&c,mode,60.+i/(mode==1?30.:60.));
+        generated=reuse_output?fg_encode_prepared_reusing_output(cb,real,nil,&inputs,&c,mode,60.+i/(mode==1?30.:60.)):
+            fg_encode_prepared(cb,real,nil,&inputs,&c,mode,60.+i/(mode==1?30.:60.));
         assert(state && state->prepared && state->input_width==W && state->width==ow);
         assert(state->previous->depth==z && state->previous->motion==motion);
         if(i<2)assert(!generated);else assert(generated && generated.width==ow && generated.height==oh);
         [cb commit];[cb waitUntilCompleted];assert(!cb.error);
     }
+    if(reuse_output)assert(state->outputs.count==1);
     NSData *data=readback_pixels(generated,4);const uint8_t *pixels=data.bytes;unsigned row=(ow*4+255)&~255;
     double errors[5]={0};
     for(unsigned shift=12;shift<=16;shift++)for(unsigned y=48;y<oh-48;y++)for(unsigned x=64;x<200;x++) {
@@ -270,7 +354,10 @@ int main(void) {@autoreleasepool {
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if(@available(macOS 26.0,*)) {
     geometry_motion_test(1);geometry_motion_test(2);
-    prepared_temporal_test(1);prepared_temporal_test(2);
+    pooled_output_test(1);pooled_output_test(2);
+    pooled_output_recovery_test(1);pooled_output_recovery_test(2);
+    prepared_temporal_test(1,false);prepared_temporal_test(2,false);
+    prepared_temporal_test(1,true);prepared_temporal_test(2,true);
     for(int mode=1;mode<=2;mode++) for(int reversed=0;reversed<=1;reversed++) for(int native=0;native<=1;native++) {
         fg_reset(); double dt=mode==1?1./30:1./60, now=1.;
         id<MTLTexture> z=depth(reversed,native);
@@ -395,6 +482,15 @@ int main(void) {@autoreleasepool {
       assert(!encode(scene(0,false),nil,z,&c,1,30.));
       assert(!encode(scene(0,false),nil,z,&c,1,30.+1./30));
       assert(encode(scene(0,false),nil,z,&c,1,30.+2./30)); }
+    fg_reset();
+    { FgCamera c=camera(0,false);id<MTLTexture> z=depth(false,false),last=nil;
+      for(unsigned i=0;i<4;i++) {
+        id<MTLCommandBuffer> cb=[queue commandBuffer];
+        id<MTLTexture> out=fg_encode_view_reusing_output(cb,scene(0,false),nil,NULL,z,NULL,nil,&c,1,0,31.+i/30.);
+        if(i<2)assert(!out);else {assert(out.pixelFormat==MTLPixelFormatRGBA16Float);if(last)assert(last==out);last=out;}
+        [cb commit];[cb waitUntilCompleted];assert(!cb.error);
+      }
+      assert(state->outputs.count==1); }
     unsetenv("LARECOMP_FG_OUTPUT_FP16");fg_reset();
     // Change generated resolution live while scene/depth/motion remain at native size.
     {
@@ -419,7 +515,7 @@ int main(void) {@autoreleasepool {
         }
         fg_reset();
     }
-    puts("PASS: both modes, normal/reversed native/float depth, motion scenes, 4px X/-3px Y backward motion, geometry override/sentinel/nonfinite fallback/scaling, interior midpoint within 1px, private output distinct from endpoints, reset/gap/nil/off/UI/cut/resize, in-flight retention");
+    puts("PASS: both modes, normal/reversed native/float depth, motion scenes, 4px X/-3px Y backward motion, geometry override/sentinel/nonfinite fallback/scaling, interior midpoint within 1px, private output distinct from endpoints, reset/gap/nil/off/UI/cut/resize, immutable outputs, bounded completion-safe output reuse, in-flight retention");
     }
 #endif
     return 0;

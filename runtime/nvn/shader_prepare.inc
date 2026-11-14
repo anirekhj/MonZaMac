@@ -48,14 +48,18 @@ static NSDictionary *prep_key_dict(const ShaderKey *k) {
     for (int i = 0; i < 32; i++) [attr addObject:@(k->attr_kind[i])];
     for (int i = 0; i < 8; i++) [rt addObject:@(k->rt_kind[i])];
     for (int i = 0; i < 4; i++) { [count addObject:@(k->xfb_count[i])]; [stride addObject:@(k->xfb_stride[i])]; }
-    return @{@"attr": attr, @"rt": rt, @"xfb_count": count, @"xfb_stride": stride,
+    NSMutableDictionary *key = [@{@"attr": attr, @"rt": rt, @"xfb_count": count, @"xfb_stride": stride,
              @"params": @[@(k->depth_minus_one), @(k->flip_y), @(k->flip_x), @(k->vs_out_mask), @(k->glsl),
-                          @(k->stencil_slots), @(k->sint_slots), @(k->uint_slots), @(k->xfb_void), @(k->img_sint), @(k->img_uint)]};
+                          @(k->stencil_slots), @(k->sint_slots), @(k->uint_slots), @(k->xfb_void), @(k->img_sint), @(k->img_uint)]} mutableCopy];
+    // Omit the ordinary value so existing recipes keep their exact identities.
+    if (k->fg_motion) key[@"fg_motion"] = @(k->fg_motion);
+    return key;
 }
 
 static bool prep_key_parse(id d, ShaderKey *k) {
-    if (![d isKindOfClass:NSDictionary.class]) return false;
-    uint32_t a[32], r[8], c[4], s[4], p[11];
+    if (![d isKindOfClass:NSDictionary.class] || [d count] != (d[@"fg_motion"] ? 6 : 5)) return false;
+    uint32_t a[32], r[8], c[4], s[4], p[11], motion = 0;
+    if (d[@"fg_motion"] && !prep_uint(d[@"fg_motion"], 2, &motion)) return false;
     if (!prep_array(d[@"attr"], 32, 2, a) || !prep_array(d[@"rt"], 8, 2, r) ||
         !prep_array(d[@"xfb_count"], 4, 255, c) || !prep_array(d[@"xfb_stride"], 4, 65535, s) ||
         !prep_array(d[@"params"], 11, UINT32_MAX, p)) return false;
@@ -66,6 +70,7 @@ static bool prep_key_parse(id d, ShaderKey *k) {
     for (int i = 0; i < 4; i++) { k->xfb_count[i] = c[i]; k->xfb_stride[i] = s[i]; }
     k->depth_minus_one = p[0]; k->flip_y = p[1]; k->flip_x = p[2]; k->vs_out_mask = p[3]; k->glsl = p[4];
     k->stencil_slots = p[5]; k->sint_slots = p[6]; k->uint_slots = p[7]; k->xfb_void = p[8]; k->img_sint = p[9]; k->img_uint = p[10];
+    k->fg_motion = (uint8_t)motion;
     return true;
 }
 
@@ -134,8 +139,6 @@ static MTLRenderPipelineDescriptor *prep_descriptor(id d, Prog *pr) {
 }
 
 static NSDictionary *prep_program_record(NvnProgram *p, const ShaderKey *vk, const ShaderKey *fk) {
-    // Runtime-only motion instrumentation is outside the shared recipe key schema.
-    if(vk->fg_motion || fk->fg_motion)return nil;
     NSString *vs = prep_stage_hash(&p->stages[0]);
     NSString *fs = p->stage_mask & 2 ? prep_stage_hash(&p->stages[1]) : @"";
     if (!vs || !fs) return nil;

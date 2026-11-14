@@ -2328,6 +2328,15 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
 
 #include "shader_early.inc"
 
+// These descriptor APIs exist on macOS 26 but need Apple10 hardware. Older
+// devices retain the same averaging / zero-bias fallback as older OS releases.
+static bool native_sampler_features_available(void) {
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if (@available(macOS 26.0, *)) return [dev supportsFamily:MTLGPUFamilyApple10];
+#endif
+    return false;
+}
+
 static id<MTLSamplerState> sampler_for(NvnSamplerDesc *d) {
     if (d->backend) return (__bridge id<MTLSamplerState>)d->backend;
     MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
@@ -2354,11 +2363,15 @@ static id<MTLSamplerState> sampler_for(NvnSamplerDesc *d) {
         sd.borderColor = MTLSamplerBorderColorOpaqueBlack;
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if (@available(macOS 26.0, *)) {
-        if (d->reduction == 1) sd.reductionMode = MTLSamplerReductionModeMinimum;
-        else if (d->reduction == 2) sd.reductionMode = MTLSamplerReductionModeMaximum;
-        sd.lodBias = d->reduction ? 0 : d->lod_bias;  // (the Hi-Z min / max sampler keeps the level the culling asks for)
+        if (native_sampler_features_available()) {
+            if (d->reduction == 1) sd.reductionMode = MTLSamplerReductionModeMinimum;
+            else if (d->reduction == 2) sd.reductionMode = MTLSamplerReductionModeMaximum;
+            sd.lodBias = d->reduction ? 0 : d->lod_bias;  // (the Hi-Z min / max sampler keeps the level the culling asks for)
+        }
     }
 #endif
+    if ((d->reduction || d->lod_bias != 0) && !native_sampler_features_available() && devlog_on("samplers"))
+        devlog("samplers", "native reduction / LOD bias unavailable on %s; using averaging / zero bias", dev.name.UTF8String);
     sd.lodMinClamp = d->lod_min;
     sd.lodMaxClamp = d->lod_max > 1000 ? FLT_MAX : d->lod_max;
     if (d->max_aniso > 1 && !d->reduction) sd.maxAnisotropy = (NSUInteger)fminf(d->max_aniso, 16);

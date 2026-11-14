@@ -72,8 +72,10 @@ The per-vertex path is enabled with frame generation; `LARECOMP_FG_VERTEX_MOTION
 Direct single-instance skinned draws with compatible layout and a free MRT7 are tracked, in the G-buffer, recognised by its
 formats and a common size for its targets and depth. Other G-buffer draws write
 an invalid-motion sentinel, so covered background motion cannot leak into foreground objects. The motion variants of
-a shader compile when first drawn, so a new character can cause a short hitch. These limits do not establish
-artifact-free interpolation.
+a shader can still compile when first drawn, so a new character can cause a short hitch. Their motion mode is now
+part of the metadata-only recipe key: learned history and foreground-invalidation variants can be prepared with
+known shaders or compiled early on later runs, without aliasing the ordinary shader. Existing ordinary recipes keep
+their identities. These limits do not establish artifact-free interpolation.
 
 ## Temporal reconstruction
 

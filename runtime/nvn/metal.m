@@ -804,8 +804,9 @@ static void save_png(id<MTLTexture> tex, const char *path) { renderer_save_textu
     id<MTLFXSpatialScaler> fx;
     id<MTLTexture> fx_out, edges, weights, smaa_out;
     id<MTLRenderPipelineState> pe, pw, pb;
-    NSUInteger fx_iw, fx_ih, fx_ow, fx_oh, smaa_w, smaa_h;
+    NSUInteger fx_iw, fx_ih, fx_ow, fx_oh;
     MTLPixelFormat fx_fmt, smaa_fmt;
+    double fx_retry_after;
     bool smaa_failed;
 }
 @end
@@ -829,21 +830,27 @@ static id<MTLTexture> metalfx_upscale(id<MTLCommandBuffer> cb, id<MTLTexture> in
     if (ow <= in.width + 1 && oh <= in.height + 1) return nil;  // not an upscale: plain sampling is right
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;
-    if (!effects->fx || effects->fx_iw != in.width || effects->fx_ih != in.height || effects->fx_ow != ow || effects->fx_oh != oh || effects->fx_fmt != in.pixelFormat) {
+    bool same = effects->fx_iw == in.width && effects->fx_ih == in.height && effects->fx_ow == ow &&
+                effects->fx_oh == oh && effects->fx_fmt == in.pixelFormat;
+    if (!effects->fx || !effects->fx_out || !same) {
+        if (same && CACurrentMediaTime() < effects->fx_retry_after) return nil;
         MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
         d.inputWidth = in.width; d.inputHeight = in.height;
         d.outputWidth = ow; d.outputHeight = oh;
         d.colorTextureFormat = in.pixelFormat;
         d.outputTextureFormat = in.pixelFormat;
         d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;  // (gamma-encoded 8-bit image)
-        effects->fx = [d newSpatialScalerWithDevice:dev];
+        id<MTLFXSpatialScaler> fx = same && effects->fx ? effects->fx : [d newSpatialScalerWithDevice:dev];
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:in.pixelFormat width:ow height:oh mipmapped:NO];
-        td.usage = effects->fx ? effects->fx.outputTextureUsage | MTLTextureUsageShaderRead : MTLTextureUsageShaderRead;
+        td.usage = fx ? fx.outputTextureUsage | MTLTextureUsageShaderRead : MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModePrivate;
-        effects->fx_out = [dev newTextureWithDescriptor:td];
+        id<MTLTexture> output = fx ? [dev newTextureWithDescriptor:td] : nil;
+        effects->fx = fx;
+        effects->fx_out = output;
+        effects->fx_retry_after = fx && output ? 0 : CACurrentMediaTime() + 0.5;
         effects->fx_iw = in.width; effects->fx_ih = in.height; effects->fx_ow = ow; effects->fx_oh = oh; effects->fx_fmt = in.pixelFormat;
         LOG("[metalfx] %lux%lu -> %lux%lu (%s)\n", (unsigned long)in.width, (unsigned long)in.height, (unsigned long)ow,
-            (unsigned long)oh, effects->fx ? "ok" : "FAILED");
+            (unsigned long)oh, fx && output ? "ok" : "FAILED");
     }
     return effects->fx && effects->fx_out ? effects->fx_out : nil;
 }
@@ -851,10 +858,9 @@ static id<MTLTexture> metalfx_upscale(id<MTLCommandBuffer> cb, id<MTLTexture> in
 // blending weights -> neighbourhood blending, at the game image's size, before the present / MetalFX. The reference
 // SMAA.hlsl has no Metal mode: it is built through its SMAA_CUSTOM_SL porting macros, with a few textual fixes for
 // MSL (out / inout parameters and array parameters as references, no swizzles bound to them, no discard in a
-// helper). The render-target size is a literal in the source (SMAA's preferred form): the library is compiled for
-// each new image size, on first use - a problem there is logged once and turns SMAA off. Metal's texture origin is
-// top-left, as SMAA expects.
-static NSString *smaa_msl(NSUInteger w, NSUInteger h) {
+// helper). Metrics belong to a thread-local helper so every SMAA function can use runtime dimensions without
+// recompiling shaders as dynamic resolution changes. Metal's texture origin is top-left, as SMAA expects.
+static NSString *smaa_msl(void) {
     extern const char smaa_hlsl_src[];
     NSMutableString *s = [NSMutableString stringWithUTF8String:smaa_hlsl_src];
     struct { const char *from, *to; } fix[] = {
@@ -877,12 +883,12 @@ static NSString *smaa_msl(NSUInteger w, NSUInteger h) {
     };
     for (size_t i = 0; i < sizeof fix / sizeof fix[0]; i++)
         [s replaceOccurrencesOfString:@(fix[i].from) withString:@(fix[i].to) options:0 range:NSMakeRange(0, s.length)];
-    NSString *head = [NSString stringWithFormat:
+    NSString *head =
         @"#include <metal_stdlib>\n"
         "using namespace metal;\n"
         "#define SMAA_CUSTOM_SL\n"
         "#define SMAA_PRESET_HIGH\n"
-        "#define SMAA_RT_METRICS float4(%.9g, %.9g, %.1f, %.1f)\n"
+        "#define SMAA_RT_METRICS metrics\n"
         "constexpr sampler LinearSampler(filter::linear, address::clamp_to_edge);\n"
         "constexpr sampler PointSampler(filter::nearest, address::clamp_to_edge);\n"
         "#define SMAATexture2D(tex) texture2d<float> tex\n"
@@ -896,29 +902,32 @@ static NSString *smaa_msl(NSUInteger w, NSUInteger h) {
         "#define SMAA_FLATTEN\n"
         "#define SMAA_BRANCH\n"
         "#define lerp(a, b, t) mix(a, b, t)\n"
-        "#define mad(a, b, c) fma(a, b, c)\n",
-        1.0 / w, 1.0 / h, (double)w, (double)h];
+        "#define mad(a, b, c) fma(a, b, c)\n"
+        "struct Smaa { float4 metrics;\n";
     NSString *tail =
-        @"struct V { float4 pos [[position]]; };\n"
+        @"};\nstruct V { float4 pos [[position]]; };\n"
         "vertex V smaa_vs(uint vid [[vertex_id]]) {\n"
         "  float2 p = float2((vid << 1) & 2, vid & 2);\n"
         "  V o; o.pos = float4(p * 2.0 - 1.0, 0, 1); return o; }\n"
-        "fragment float4 smaa_edge(V in [[stage_in]], texture2d<float> t0 [[texture(0)]]) {\n"
+        "fragment float4 smaa_edge(V in [[stage_in]], texture2d<float> t0 [[texture(0)]], constant float4 &metrics [[buffer(0)]]) {\n"
+        "  Smaa smaa = {metrics};\n"
         "  float2 uv = in.pos.xy * SMAA_RT_METRICS.xy;\n"
         "  float4 off[3];\n"
-        "  SMAAEdgeDetectionVS(uv, off);\n"
-        "  return float4(SMAALumaEdgeDetectionPS(uv, off, t0), 0.0, 0.0); }\n"
+        "  smaa.SMAAEdgeDetectionVS(uv, off);\n"
+        "  return float4(smaa.SMAALumaEdgeDetectionPS(uv, off, t0), 0.0, 0.0); }\n"
         "fragment float4 smaa_weight(V in [[stage_in]], texture2d<float> t0 [[texture(0)]], texture2d<float> t1 [[texture(1)]],\n"
-        "                            texture2d<float> t2 [[texture(2)]]) {\n"
+        "                            texture2d<float> t2 [[texture(2)]], constant float4 &metrics [[buffer(0)]]) {\n"
+        "  Smaa smaa = {metrics};\n"
         "  float2 uv = in.pos.xy * SMAA_RT_METRICS.xy, pix;\n"
         "  float4 off[3];\n"
-        "  SMAABlendingWeightCalculationVS(uv, pix, off);\n"
-        "  return SMAABlendingWeightCalculationPS(uv, pix, off, t0, t1, t2, float4(0.0)); }\n"
-        "fragment float4 smaa_blend(V in [[stage_in]], texture2d<float> t0 [[texture(0)]], texture2d<float> t1 [[texture(1)]]) {\n"
+        "  smaa.SMAABlendingWeightCalculationVS(uv, pix, off);\n"
+        "  return smaa.SMAABlendingWeightCalculationPS(uv, pix, off, t0, t1, t2, float4(0.0)); }\n"
+        "fragment float4 smaa_blend(V in [[stage_in]], texture2d<float> t0 [[texture(0)]], texture2d<float> t1 [[texture(1)]], constant float4 &metrics [[buffer(0)]]) {\n"
+        "  Smaa smaa = {metrics};\n"
         "  float2 uv = in.pos.xy * SMAA_RT_METRICS.xy;\n"
         "  float4 off;\n"
-        "  SMAANeighborhoodBlendingVS(uv, off);\n"
-        "  return float4(SMAANeighborhoodBlendingPS(uv, off, t0, t1).rgb, 1.0); }\n";
+        "  smaa.SMAANeighborhoodBlendingVS(uv, off);\n"
+        "  return float4(smaa.SMAANeighborhoodBlendingPS(uv, off, t0, t1).rgb, 1.0); }\n";
     return [NSString stringWithFormat:@"%@%@%@", head, s, tail];
 }
 
@@ -940,6 +949,8 @@ static void smaa_pass(id<MTLCommandBuffer> cb, id<MTLRenderPipelineState> p, id<
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (renderer_profile_active()) e.label = [NSString stringWithFormat:@"SMAA %lux%lu", (unsigned long)dst.width, (unsigned long)dst.height];
     [e setRenderPipelineState:p];
+    float metrics[4] = {1.0f / dst.width, 1.0f / dst.height, (float)dst.width, (float)dst.height};
+    [e setFragmentBytes:metrics length:sizeof metrics atIndex:0];
     [e setFragmentTexture:t0 atIndex:0];
     if (t1) [e setFragmentTexture:t1 atIndex:1];
     if (t2) [e setFragmentTexture:t2 atIndex:2];
@@ -961,9 +972,10 @@ static id<MTLTexture> smaa_encode(id<MTLCommandBuffer> cb, id<MTLTexture> in, Pr
         search = [dev newTextureWithDescriptor:sd];
         [search replaceRegion:MTLRegionMake2D(0, 0, 64, 16) mipmapLevel:0 withBytes:smaa_search_tex() bytesPerRow:64];
     }
-    if (!effects->pe || effects->smaa_w != in.width || effects->smaa_h != in.height || effects->smaa_fmt != in.pixelFormat) {
+    if (!effects->pe || effects->smaa_fmt != in.pixelFormat) {
         NSError *err = nil;
-        id<MTLLibrary> lib = [dev newLibraryWithSource:smaa_msl(in.width, in.height) options:nil error:&err];
+        static id<MTLLibrary> lib;
+        if (!lib || lib.device != dev) lib = [dev newLibraryWithSource:smaa_msl() options:nil error:&err];
         if (!lib) { LOG("[smaa] shader: %s\n", err.localizedDescription.UTF8String); effects->smaa_failed = true; return in; }
         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction = [lib newFunctionWithName:@"smaa_vs"];
@@ -976,8 +988,8 @@ static id<MTLTexture> smaa_encode(id<MTLCommandBuffer> cb, id<MTLTexture> in, Pr
         pd.colorAttachments[0].pixelFormat = in.pixelFormat;
         effects->pb = effects->pw ? [dev newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
         if (!effects->pb) { LOG("[smaa] pipeline: %s\n", err.localizedDescription.UTF8String); effects->smaa_failed = true; return in; }
-        effects->smaa_w = in.width; effects->smaa_h = in.height; effects->smaa_fmt = in.pixelFormat;
-        LOG("[smaa] %lux%lu\n", (unsigned long)in.width, (unsigned long)in.height);
+        effects->smaa_fmt = in.pixelFormat;
+        LOG("[smaa] pipelines ready for format %lu\n", (unsigned long)in.pixelFormat);
     }
     effects->edges = smaa_target(effects->edges, in.width, in.height, MTLPixelFormatRGBA8Unorm);
     effects->weights = smaa_target(effects->weights, in.width, in.height, MTLPixelFormatRGBA8Unorm);
@@ -1337,6 +1349,9 @@ void backend_present(NvnTexture *t) {
         menu_render(dev, cb, present_target);
         id<MTLTexture> fg_image=nil, fg_source=nil, fg_z=nil, fg_window_image=nil;
         FgCamera fg_camera; FgRect fg_rect={0};
+        const char *fg_shot=getenv("LARECOMP_FG_SHOT_AT");
+        static bool fg_shot_done;
+        bool fg_capture=fg_shot && !fg_shot_done && frame>=(uint64_t)strtoull(fg_shot,NULL,10);
         double fg_clock=CACurrentMediaTime();
         static double fg_previous_source_time;static uint64_t fg_time_epoch;
         uint64_t clock_epoch=fg_display_epoch();
@@ -1353,8 +1368,9 @@ void backend_present(NvnTexture *t) {
                 if(r.width && r.height && r.x+r.width<=fg_ui.width && r.y+r.height<=fg_ui.height)ui_rect=r;
             }
             if(temporal){
-                fg_image=fg_encode_prepared(cb,temporal_output.scene,temporal_output.composited,&temporal_output.prepared,&fg_camera,fg_mode,fg_clock);
-            } else fg_image=fg_encode_view(cb,fg_source,fg_ui,&ui_rect,fg_z,&fg_rect,renderer_fg_motion(),&fg_camera,fg_mode,(!temporal_requested && g_settings.frame_generation_performance)?1920:0,fg_clock);
+                // Captures read the effect output in a later command buffer, so keep it immutable.
+                fg_image=(fg_capture?fg_encode_prepared:fg_encode_prepared_reusing_output)(cb,temporal_output.scene,temporal_output.composited,&temporal_output.prepared,&fg_camera,fg_mode,fg_clock);
+            } else fg_image=(fg_capture?fg_encode_view:fg_encode_view_reusing_output)(cb,fg_source,fg_ui,&ui_rect,fg_z,&fg_rect,renderer_fg_motion(),&fg_camera,fg_mode,(!temporal_requested && g_settings.frame_generation_performance)?1920:0,fg_clock);
         } else fg_reset();
         if(fg_image) {
             id<MTLTexture> filtered=fg_match_format(cb,fg_image,temporal?temporal_output.scene.pixelFormat:fg_source.pixelFormat);
@@ -1404,9 +1420,7 @@ void backend_present(NvnTexture *t) {
         }];
         renderer_gpu_timing_mark_commit(gpu_present_timing);
         [cb commit];
-        const char *fg_shot=getenv("LARECOMP_FG_SHOT_AT");
-        static bool fg_shot_done;
-        if(fg_image && fg_shot && !fg_shot_done && frame>=(uint64_t)strtoull(fg_shot,NULL,10) && (fg_shot_done=true)) {
+        if(fg_image && fg_capture && (fg_shot_done=true)) {
             if(getenv("LARECOMP_FG_DUMP"))fg_debug_dump("build/fg-debug");
             renderer_save_texture(fg_image,"build/fg-generated.png");
             renderer_save_texture(fg_source,"build/fg-scene.png");

@@ -98,6 +98,27 @@ class Profiles(unittest.TestCase):
         c=m.export_catalog([recipe(self.digest)],self.index,False)
         c['profiles']['vertex_keys'].append(c['profiles']['vertex_keys'][0])
         with self.assertRaises(ValueError):m.validate_catalog(c)
+    def test_motion_variants_round_trip_without_aliasing_ordinary_keys(self):
+        ordinary=recipe(self.digest)
+        history=json.loads(json.dumps(ordinary));invalidating=json.loads(json.dumps(ordinary))
+        history['program']['vkey']['fg_motion']=1;history['program']['fkey']['fg_motion']=1
+        invalidating['program']['fkey']['fg_motion']=2
+        catalog=m.export_catalog([ordinary,history,invalidating],self.index,False)
+        self.assertEqual(len(catalog['recipes']),3)
+        rows=m.expand_catalog(m.validate_catalog(catalog))['recipes']
+        self.assertEqual({m.encoded(r) for r in rows},{m.encoded(m.recipe(r)) for r in (ordinary,history,invalidating)})
+        contribution=m.contribution_document(rows)
+        self.assertEqual({m.encoded(r) for r in m.contribution_recipes(contribution)},{m.encoded(r) for r in rows})
+        installed=m.prepare(self.game,catalog,self.root/'motion-prepared',None)
+        prepared=[json.loads(line) for line in (installed/'recipes.jsonl').read_text().splitlines()]
+        self.assertEqual({m.encoded(r) for r in prepared},{m.encoded(r) for r in rows})
+        zero=json.loads(json.dumps(ordinary['program']['vkey']));zero['fg_motion']=0
+        self.assertEqual(m.key(zero),ordinary['program']['vkey'])
+        for bad in (-1,3,1.5,'1',None):
+            with self.subTest(motion=bad),self.assertRaises(ValueError):
+                m.key(dict(zero,fg_motion=bad))
+        with self.assertRaises(ValueError):m.key(dict(zero,shader_code='unwanted'))
+
     def test_legacy_local_catalog_can_still_be_read(self):
         c=m.expand_catalog(m.export_catalog([recipe(self.digest)],self.index,False))
         self.assertEqual(c['version'],1)

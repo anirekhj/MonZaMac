@@ -53,8 +53,6 @@ static bool recipe_valid(id r) {
     id p = r[@"program"], d = r[@"pipeline"]; ShaderKey vk, fk;
     if (![p isKindOfClass:NSDictionary.class] || [p count] != 4 || !prep_hash_valid(p[@"vs"]) ||
         ![p[@"fs"] isKindOfClass:NSString.class] || ([p[@"fs"] length] && !prep_hash_valid(p[@"fs"])) ||
-        ![p[@"vkey"] isKindOfClass:NSDictionary.class] || [p[@"vkey"] count] != 5 ||
-        ![p[@"fkey"] isKindOfClass:NSDictionary.class] || [p[@"fkey"] count] != 5 ||
         !prep_key_parse(p[@"vkey"], &vk) || !prep_key_parse(p[@"fkey"], &fk) ||
         ![d isKindOfClass:NSDictionary.class] || [d count] != 4) return false;
     uint32_t scratch[9];
@@ -69,6 +67,13 @@ static bool recipe_valid(id r) {
 }
 static NSString *recipe_line(id record) {
     if (!recipe_valid(record)) return nil;
+    if (record[@"program"]) {
+        NSMutableDictionary *row = [record mutableCopy], *program = [record[@"program"] mutableCopy];
+        ShaderKey vk, fk;
+        prep_key_parse(program[@"vkey"], &vk); prep_key_parse(program[@"fkey"], &fk);
+        program[@"vkey"] = prep_key_dict(&vk); program[@"fkey"] = prep_key_dict(&fk);
+        row[@"program"] = program; record = row;
+    }
     id normalized = recipe_numbers(record);
     NSData *data = normalized ? prep_json(normalized) : nil;
     return data.length && data.length <= (64u << 10) ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;

@@ -34,12 +34,15 @@ def array(value,n,limit):
     return [number(x,limit) for x in value]
 
 def key(value):
-    fields(value,('attr','rt','xfb_count','xfb_stride','params'))
+    fields(value,('attr','rt','xfb_count','xfb_stride','params') + (('fg_motion',) if isinstance(value,dict) and 'fg_motion' in value else ()))
+    motion=number(value.get('fg_motion',0),2)
     params=array(value['params'],11,(1<<32)-1)
     if any(params[i]>1 for i in (0,1,2,8)) or params[4]!=0 or params[9]>255 or params[10]>255:
         raise ValueError('invalid specialization flags')
-    return dict(attr=array(value['attr'],32,2),rt=array(value['rt'],8,2),
-                xfb_count=array(value['xfb_count'],4,255),xfb_stride=array(value['xfb_stride'],4,65535),params=params)
+    out=dict(attr=array(value['attr'],32,2),rt=array(value['rt'],8,2),
+             xfb_count=array(value['xfb_count'],4,255),xfb_stride=array(value['xfb_stride'],4,65535),params=params)
+    if motion: out['fg_motion']=motion
+    return out
 
 def recipe(value):
     fields(value,('version','program','pipeline'))
