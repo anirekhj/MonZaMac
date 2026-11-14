@@ -221,10 +221,11 @@ int main(int argc,char **argv){
  fill_state(&cpu);assert(*(int32_t *)(state_bytes+24)==10000);assert(*(int32_t *)(state_bytes+28)>9000);assert(*(uint64_t *)(state_bytes+8)&1);
  // Npad id and style follow the configured operation mode.
  g_settings.handheld=true;id=0;fill_state(&cpu);assert(*(uint32_t *)(state_bytes+32)==0);
- id=0x20;fill_state(&cpu);assert(*(uint32_t *)(state_bytes+32)==1);
+ id=0x20;fill_state(&cpu);assert(*(uint32_t *)(state_bytes+32)==0x3f);
  Cpu style={0};style.x[0]=(uintptr_t)&id;hid_style_set(&style);assert(style.x[0]==2);
  id=0;style.x[0]=(uintptr_t)&id;hid_style_set(&style);assert(style.x[0]==0);
  g_settings.handheld=false;style.x[0]=(uintptr_t)&id;hid_style_set(&style);assert(style.x[0]==1);
+ fill_state(&cpu);assert(*(uint32_t *)(state_bytes+32)==1);
  key_rx=key_ry=key_buttons=0;sample(.2f,.5f);
  setenv("LARECOMP_ROUTE","synthetic-unused-route",1);input_gyro_update(fake_window);assert_zero();assert(input_gyro_status()==GYRO_STATUS_OFF);
  unsetenv("LARECOMP_ROUTE");input_gyro_update(fake_window);sample(.2f,.5f);

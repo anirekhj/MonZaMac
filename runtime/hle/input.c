@@ -963,7 +963,7 @@ static void fill_state(Cpu *c) {
     *(int32_t *)(s + 20) = ly;
     *(int32_t *)(s + 24) = rx;
     *(int32_t *)(s + 28) = ry;
-    *(uint32_t *)(s + 32) = 1;  // IsConnected
+    *(uint32_t *)(s + 32) = g_settings.handheld ? 0x3f : 1;  // Handheld: connected/wired virtual left and right attachments.
 }
 
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", hid_state_fullkey) { fill_state(c); }
