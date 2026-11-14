@@ -97,7 +97,10 @@ static void calibration_sample(GyroCamera *c, uint64_t ns, const float gyro[3], 
 void gyro_camera_sample(GyroCamera *c, uint64_t ns, const float gyro[3], const float accel[3], bool active) {
     if (!c) return;
     activation(c, active);
-    if (!ns || (c->sample_ns && ns <= c->sample_ns) || !vector_valid(gyro, 100)) {
+    // After a release/menu/focus reset, queued pre-transition reports must not
+    // seed fresh motion just because they arrive after aiming is enabled again.
+    if (!ns || (c->sample_ns && ns <= c->sample_ns) ||
+        (active && !c->have_sample && ns < c->update_ns) || !vector_valid(gyro, 100)) {
         clear_motion(c);
         clear_quiet(c);
         return;

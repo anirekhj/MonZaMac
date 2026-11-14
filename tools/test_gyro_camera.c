@@ -149,6 +149,13 @@ static void release(void) {
     gyro_camera_reset(&c); read_stick(&c,BASE+MS(1020),true,&normal,o); zero(o);
     sample(&c,BASE+MS(1030),0,1,0,NULL,true);
     read_stick(&c,BASE+MS(1030),true,&normal,o); near(o[0],-gain(1,1));
+    gyro_camera_reset(&c); sample(&c,BASE,0,1,0,NULL,true);
+    read_stick(&c,BASE+MS(10),false,&normal,o); zero(o);
+    read_stick(&c,BASE+MS(20),true,&normal,o); zero(o);
+    sample(&c,BASE+MS(15),0,1,0,NULL,true); // late event from before reactivation
+    read_stick(&c,BASE+MS(21),true,&normal,o); zero(o);
+    sample(&c,BASE+MS(22),0,0,0,NULL,true);
+    read_stick(&c,BASE+MS(22),true,&normal,o); zero(o);
 }
 static void rates(void) {
     const unsigned sensor_rates[]={100,250}, poll_rates[]={30,60,120};
