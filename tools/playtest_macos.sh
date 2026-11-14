@@ -246,17 +246,17 @@ if [[ "$NO_SHADER_WARM" == 1 ]]; then printf 'Startup shader warmup skipped for 
 printf 'F1: settings/menu.  F3: FPS and resolution (Fn+F1/F3 if needed).\n'
 printf 'Use the same scene and settings for comparison; first-time shaders may still hitch.\n'
 printf 'Save and quit the test normally when finished. Test progress stays in the test profile.\n'
-printf 'Keep this Terminal window open while playing.\nLog: %s\nFrame-generation diagnostics: %s\n\n' "$LOG" "$DEVLOG"
+printf 'Keep this Terminal window open while playing.\nLog: %s\nFrame generation and motion diagnostics: %s\n\n' "$LOG" "$DEVLOG"
 cd -- "$REPO"
 # A clean environment prevents inherited automation, replay, validation or library-injection hooks.
-# Only the framegen diagnostic subject is enabled here; each run keeps its own file.
+# Enable framegen and native-motion diagnostics for this playtest; each run keeps its own file.
 # The reactive-mask experiment stays at its default (off); copied UI settings remain in charge.
 if /usr/bin/env -i \
     HOME="$HOME" USER="$(/usr/bin/id -un)" LOGNAME="$(/usr/bin/id -un)" \
     PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-en_US.UTF-8}" \
     LARECOMP_DATA_ROOT="$PROFILE" LARECOMP_GAME_LIB="$GAME_LIB" \
-    LARECOMP_DEVLOG=framegen LARECOMP_DEVLOG_FILE="$DEVLOG" \
+    LARECOMP_DEVLOG=framegen,motion LARECOMP_DEVLOG_FILE="$DEVLOG" \
     ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
     "$BINARY" "$ASSETS" >> "$LOG" 2>&1; then
     status=0
@@ -269,6 +269,6 @@ if [[ "$status" != 0 ]]; then
 else
     printf '\nTest closed. Copied progress and settings are preserved.\n'
 fi
-printf 'Log: %s\nFrame-generation diagnostics: %s\n' "$LOG" "$DEVLOG"
+printf 'Log: %s\nFrame generation and motion diagnostics: %s\n' "$LOG" "$DEVLOG"
 pause_terminal
 exit "$status"

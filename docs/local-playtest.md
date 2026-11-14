@@ -31,9 +31,10 @@ re-import the source profile. To make a new copy, choose a new `--profile` path.
 Choose the copied save at the start screen, then Continue offline. F1 opens
 settings; F3 shows FPS/resolution (Fn may be needed). Compare the same scene and
 settings after shaders settle. The launcher clears inherited test/Metal validation
-hooks, keeps normal startup shader warmup, and enables only the `framegen`
-developer-log subject. It prints unique per-run play and frame-generation log
-paths under the test profile's `logs/`. A copied setting that already enables
+hooks, keeps normal startup shader warmup, and enables the `framegen` and `motion`
+developer-log subjects for this playtest. It prints unique per-run play and diagnostic
+log paths under the test profile's `logs/`. The diagnostic filename keeps its
+`-framegen.txt` suffix and contains both subjects, including native orientation reads. A copied setting that already enables
 all developer subjects remains a copied user preference. Keep the terminal open
 while playing, and quit normally when finished. Test saves are not copied back.
 
