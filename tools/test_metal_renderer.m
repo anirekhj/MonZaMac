@@ -2822,6 +2822,109 @@ static void pipeline_archive_reload(void) {  // a pipeline built once is found i
     destroy_texture(&color);
 }
 
+// Author-created camera matrices; no game shader source or instructions are needed.
+static void capture_camera_fixture(float block[136]) {
+    memset(block, 0, 136 * sizeof *block);
+    for (int i = 0; i < 4; i++) block[16 + i * 5] = block[64 + i * 5] = 1;
+    float *p = block + 32, *inverse = block + 80;
+    p[0] = p[5] = 1; p[10] = 1.f / 99; p[11] = -1; p[14] = 100.f / 99;
+    inverse[0] = inverse[5] = 1; inverse[11] = 1 / p[14]; inverse[14] = -1; inverse[15] = p[10] / p[14];
+    memcpy(block, p, 64); memcpy(block + 48, inverse, 64);
+}
+
+static void frame_generation_capture(void) {
+    if (!fg_supported()) { fprintf(stderr, "SKIP frame-generation capture: MetalFX interpolation unavailable\n"); return; }
+    Settings previous = g_settings;
+    g_settings.frame_generation = FRAME_GENERATION_60_120; g_settings.dev_uncapped_fps = false; g_settings.upscaler = 0;
+    CHECK(settings_frame_generation(), "capture fixture enables the production frame-generation gate");
+    int previous_cbuf_base = cbuf_base; cbuf_base = 3;
+    NvnTexture color = test_texture(1, 64, 64, 1, 1, 0x25, 1);
+    NvnTexture depth = test_texture(1, 64, 64, 1, 1, 0x33, 1);
+    NvnTexture multisample = test_texture(1, 64, 64, 1, 1, 0x33, 4);
+    NvnTexture array = test_texture(4, 64, 64, 2, 1, 0x33, 1);
+    id<MTLTexture> source = renderer_texture(&color, nil, true);
+    CHECK(source && renderer_texture(&depth, nil, false), "capture fixture allocates real color and typed depth");
+    NvnTexEntry entries[2] = {{0}, {.tex = &depth}};
+    NvnDescPool pool = {.count = 2, .entries = entries}; st.tpool = &pool;
+    st.tex[1][28] = 1; // texture handle offset 256, the verified sampled scene depth
+    bind_targets(&color, NULL, NULL);
+    st.viewport[0][2] = st.viewport[0][3] = 64;
+    vp_sx = vp_sy = 1; vp_ox = vp_oy = 0;
+    float block[136];
+    st.ubuf[1][2] = (Range){.addr = (uint64_t)(uintptr_t)block, .size = sizeof block};
+    Prog *lighting = [Prog new], *fxaa = [Prog new];
+    lighting->fi = calloc(1, sizeof *lighting->fi); fxaa->fi = calloc(1, sizeof *fxaa->fi);
+    lighting->fi->msl = strdup("// authored capture fixture metadata");
+    fxaa->fi->msl = strdup("// authored final canvas fixture metadata");
+    lighting->fi->cbuf_mask = 1u << 5; lighting->fi->cbuf_size[5] = 512;
+    lighting->fi->ntex = 1; lighting->fi->tex[0] = (ShaderTexture){.handle_offset = 256, .type = TEXTYPE_2D};
+    fxaa->fg_source_hash = 0xee350631a7ed66ceull;
+    uint64_t frame = renderer_present_count();
+    // Inject only public compatibility hashes into authored metadata, never game shader assets.
+    const uint64_t hashes[] = {0x38299bbd2d7c353dull, 0xba66ab1ec82fbeacull,
+        0xa1a2c8426ac19bc8ull, 0xee350631a7ed66ceull, 0x123456789abcdef0ull, 0};
+    for (unsigned scenario = 0; scenario < 14; scenario++) {
+        bool accepted = scenario < 2, camera_accepted = accepted || scenario == 13;
+        bool recognized = accepted || scenario >= 6;
+        lighting->fg_source_hash = scenario < 6 ? hashes[scenario] : hashes[1];
+        capture_camera_fixture(block);
+        if (scenario == 6) block[48] = NAN;
+        st.ubuf[1][2].size = scenario == 7 ? 383 : sizeof block;
+        entries[1].tex = scenario == 8 ? &color : scenario == 9 ? &array :
+                         scenario == 10 ? &multisample : scenario == 11 ? NULL : &depth;
+        lighting->fi->tex[0].handle_offset = scenario == 12 ? 248 : 256;
+        st.viewport[0][2] = scenario == 13 ? 16 : 64; st.viewport[0][3] = scenario == 13 ? 8 : 64;
+        fg_camera_frame = fg_scene_frame = UINT64_MAX; fg_canvas = NULL;
+        fg_depth = fg_scene = nil; fg_active_color = source;
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = source; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 1, 0, 1);
+        enc = [cb() renderCommandEncoderWithDescriptor:rp];
+        fg_prepare_camera_capture(lighting);
+        CHECK(fg_want_bound_camera == recognized && !fg_bound_camera_valid,
+              "pre-bind recognition accepts only the two verified full-resolution lighting permutations");
+        bind_cbufs(1, lighting->fi);
+        CHECK(fg_bound_camera_valid == (recognized && scenario != 6 && scenario != 7),
+              "recognized programs decode their exact bound camera snapshot and keep strict invalid/short rejection");
+        memset(block, 0, sizeof block); // later guest writes cannot alter the camera that the GPU was bound
+        fg_observe_draw(lighting);
+        CHECK((fg_camera_frame == frame) == camera_accepted,
+              "post-draw recognition publishes both verified variants only with valid camera and typed single-sample depth");
+        if (accepted) {
+            CHECK(fabsf(fg_camera.near_plane - 1) < .00001f && fabsf(fg_camera.far_plane - 100) < .001f,
+                  "capture retains the bound matrices after the guest changes the source block");
+            st.viewport[0][2] = 32;
+            fg_observe_draw(fxaa);
+            CHECK(fg_scene_frame != frame, "a different final canvas viewport cannot publish the scene");
+            st.viewport[0][2] = 64;
+        }
+        fg_observe_draw(fxaa);
+        id<MTLTexture> scene = nil, z = nil; FgCamera camera; FgRect rect;
+        CHECK(renderer_fg_inputs(&color, &scene, &z, &camera, &rect) == accepted,
+              "final capture requires recognized lighting, matching current canvas and a useful viewport extent");
+        if (accepted) {
+            CHECK(scene && z && rect.width == 64 && rect.height == 64, "both lighting variants yield complete capture inputs");
+            CHECK(!renderer_fg_inputs(&depth, &scene, &z, &camera, &rect), "another presented canvas cannot consume the scene");
+            fg_camera_frame = UINT64_MAX;
+            CHECK(!renderer_fg_inputs(&color, &scene, &z, &camera, &rect), "a stale camera cannot consume the scene");
+            fg_camera_frame = frame; fg_scene_frame = UINT64_MAX;
+            CHECK(!renderer_fg_inputs(&color, &scene, &z, &camera, &rect), "a stale scene cannot consume the camera");
+            fg_scene_frame = frame;
+            id<MTLBuffer> pixels = read_texture(scene, 0, 0, 4);
+            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+                const uint8_t *p = (const uint8_t *)pixels.contents + y * 256 + x * 4;
+                CHECK(p[0] == 0 && p[1] == 255 && p[2] == 0 && p[3] == 255,
+                      "the captured scene contains the real blitted canvas pixels");
+            }
+        }
+        end_pass("other"); check_gpu();
+    }
+    st.tpool = NULL; st.tex[1][28] = 0; st.ubuf[1][2] = (Range){0};
+    fg_depth = fg_scene = fg_active_color = nil; fg_canvas = NULL;
+    destroy_texture(&color); destroy_texture(&depth); destroy_texture(&multisample); destroy_texture(&array);
+    cbuf_base = previous_cbuf_base; g_settings = previous;
+}
+
 typedef void (*TestFn)(void);
 static const struct { const char *name, *group; TestFn run; bool needs_sampler26; } tests[] = {
     {"uniform-snapshots", "uniforms", uniform_snapshots},
@@ -2922,6 +3025,7 @@ static const struct { const char *name, *group; TestFn run; bool needs_sampler26
     {"feedback-base-alias", "feedback", feedback_base_alias},
     {"preparation-page", "preparation", metal_test_preparation_page},
     {"frame-generation-filters", "frame-generation", metal_test_frame_generation_filters},
+    {"frame-generation-capture", "frame-generation", frame_generation_capture},
     {"shader-metadata-lifetime", "shader-memory", shader_metadata_lifetime},
 };
 

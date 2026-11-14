@@ -3024,6 +3024,19 @@ static uint64_t fg_bound_model_hash;
 static bool fg_want_bound_camera, fg_bound_camera_valid;
 static FgCamera fg_bound_camera;
 
+static bool fg_is_scene_lighting(uint64_t hash) {
+    // Both full-resolution lighting permutations were verified at matching camera,
+    // G-buffer/depth bindings and viewport. The scene can select either shader.
+    return hash == 0x38299bbd2d7c353dull || hash == 0xba66ab1ec82fbeacull;
+}
+static void fg_prepare_camera_capture(Prog *pr) {
+    fg_want_bound_camera = fg_bound_camera_valid = false;
+    if ((settings_frame_generation() || ts_enabled()) && pr && pr->fi && pr->fi->msl) {
+        if (!pr->fg_source_hash) pr->fg_source_hash = fnv64(pr->fi->msl);
+        fg_want_bound_camera = fg_is_scene_lighting(pr->fg_source_hash);
+    }
+}
+
 static void bind_cbufs(int stage, ShaderInfo *si) {
     for (int k = 0; k < 18; k++) {
         if (!(si->cbuf_mask & (1u << k))) continue;
@@ -4190,12 +4203,8 @@ static void draw(CmdRec *r, bool indexed) {
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
 
     // resources
-    fg_want_bound_camera=false;fg_bound_camera_valid=false;
+    fg_prepare_camera_capture(pr);
     fg_want_bound_model=pr->vi->uses_fg_motion;fg_bound_model_valid=false;fg_bound_model_hash=0xcbf29ce484222325ull;
-    if((settings_frame_generation() || ts_enabled()) && pr->fi && pr->fi->msl) {
-        if(!pr->fg_source_hash)pr->fg_source_hash=fnv64(pr->fi->msl);
-        fg_want_bound_camera=pr->fg_source_hash==0x38299bbd2d7c353dull;
-    }
     bind_cbufs(0, pr->vi);
     bind_cbufs(1, pr->fi);
     if(pr->vi->uses_fg_motion) {
@@ -4430,6 +4439,25 @@ static id<MTLTexture> fg_depth, fg_scene;
 static NvnTexture *fg_canvas;
 static uint64_t fg_depth_address;
 static id<MTLTexture> fg_scene_ring[3];
+static uint64_t fg_reject_frame[2] = {UINT64_MAX, UINT64_MAX};
+
+static void fg_capture_reject(uint64_t hash, const char *reason, NvnTexture *guest_depth,
+                              id<MTLTexture> depth, id<MTLTexture> source) {
+    uint64_t frame = renderer_present_count();
+    if (frame % 120 || !devlog_on("framegen")) return;
+    unsigned role = fg_is_scene_lighting(hash) ? 0 : 1;
+    if (fg_reject_frame[role] == frame) return;
+    fg_reject_frame[role] = frame;
+    float view[4]; fg_current_view(view);
+    devlog("framegen", "capture-reject frame %llu hash %016llx reason %s raw %.1f,%.1f %.1fx%.1f effective %.1f,%.1f %.1fx%.1f camera %llu bound %d bytes %llu depth_guest %ux%u target %u format %#x depth %lux%lu type %lu samples %lu source %lux%lu",
+           (unsigned long long)frame, (unsigned long long)hash, reason,
+           st.viewport[0][0], st.viewport[0][1], st.viewport[0][2], st.viewport[0][3], view[0], view[1], view[2], view[3],
+           (unsigned long long)fg_camera_frame, fg_bound_camera_valid, (unsigned long long)st.ubuf[1][2].size,
+           guest_depth ? guest_depth->width : 0, guest_depth ? guest_depth->height : 0,
+           guest_depth ? guest_depth->target : 0, guest_depth ? guest_depth->format : 0,
+           (unsigned long)depth.width, (unsigned long)depth.height, (unsigned long)depth.textureType,
+           (unsigned long)depth.sampleCount, (unsigned long)source.width, (unsigned long)source.height);
+}
 
 bool renderer_fg_inputs(NvnTexture *presented, id<MTLTexture> *scene, id<MTLTexture> *depth, FgCamera *camera, FgRect *rect) {
     uint64_t frame = renderer_present_count();
@@ -4458,15 +4486,21 @@ static void fg_observe_draw(Prog *pr) {
     if (!pr->fg_source_hash) pr->fg_source_hash = fnv64(pr->fi->msl);
     uint64_t hash = pr->fg_source_hash, frame = renderer_present_count();
     // Verified Z-A deferred lighting: camera block and full-resolution sampled depth.
-    if (hash == 0x38299bbd2d7c353dull && cbuf_base == 3 && st.ubuf[1][2].addr && st.ubuf[1][2].size >= 544) {
-        if(!fg_bound_camera_valid)return;
+    if (fg_is_scene_lighting(hash)) {
+        if (cbuf_base != 3 || !st.ubuf[1][2].addr || st.ubuf[1][2].size < 544 || !fg_bound_camera_valid) {
+            fg_capture_reject(hash, "camera-invalid", NULL, nil, fg_active_color); return;
+        }
         FgCamera camera=fg_bound_camera;
         NvnTexture *depth = NULL;
         for (int i = 0; i < pr->fi->ntex; i++)
             if (pr->fi->tex[i].handle_offset == 256) depth = shader_texture_object(1, &pr->fi->tex[i]);
-        if (!depth || depth->target != 1 || !renderer_format_is_depth(depth->format)) return;
+        if (!depth || depth->target != 1 || !renderer_format_is_depth(depth->format)) {
+            fg_capture_reject(hash, "depth-invalid", depth, nil, fg_active_color); return;
+        }
         id<MTLTexture> texture = renderer_texture(depth, nil, false);
-        if (!texture || texture.textureType != MTLTextureType2D || texture.sampleCount != 1) return;
+        if (!texture || texture.textureType != MTLTextureType2D || texture.sampleCount != 1) {
+            fg_capture_reject(hash, "depth-invalid", depth, texture, fg_active_color); return;
+        }
         if (nvn_window_origin() == 0) { // match the vertex translator's Metal clip-Y conversion
             for (int col=0;col<4;col++) camera.view_projection[col*4+1] = -camera.view_projection[col*4+1];
             for (int row=0;row<4;row++) camera.inverse_view_projection[4+row] = -camera.inverse_view_projection[4+row];
@@ -4474,21 +4508,29 @@ static void fg_observe_draw(Prog *pr) {
         fg_camera = camera; fg_depth = texture; fg_depth_address=depth->addr; fg_camera_frame = frame; fg_current_view(fg_camera_view);
     }
     // This spatial FXAA draw writes the final colour canvas before HUD/text draws.
-    if (hash == 0xee350631a7ed66ceull && fg_camera_frame == frame && st.rt.color[0] && fg_active_color) {
+    if (hash == 0xee350631a7ed66ceull) {
+        if (fg_camera_frame != frame) { fg_capture_reject(hash, "no-current-camera", NULL, fg_depth, fg_active_color); return; }
+        if (!st.rt.color[0] || !fg_active_color) { fg_capture_reject(hash, "copyfailed", NULL, fg_depth, fg_active_color); return; }
         id<MTLTexture> source = fg_active_color;
-        if (source.width != fg_depth.width || source.height != fg_depth.height || source.sampleCount != 1) return;
+        if (source.width != fg_depth.width || source.height != fg_depth.height || source.sampleCount != 1) {
+            fg_capture_reject(hash, "size", NULL, fg_depth, source); return;
+        }
         // The picture is the viewport of this draw, which must be the one the lighting draw (camera and depth) used.
         float v[4]; fg_current_view(v);
-        for (int i = 0; i < 4; i++) if (fabsf(v[i] - fg_camera_view[i]) > .5f) return;
+        for (int i = 0; i < 4; i++) if (fabsf(v[i] - fg_camera_view[i]) > .5f) {
+            fg_capture_reject(hash, "viewport-mismatch", NULL, fg_depth, source); return;
+        }
         FgRect rect = {(unsigned)lroundf(v[0]), (unsigned)lroundf(v[1]), (unsigned)lroundf(v[2]), (unsigned)lroundf(v[3])};
-        if (v[0] < 0 || v[1] < 0 || rect.width < 64 || rect.height < 64 || rect.x + rect.width > source.width || rect.y + rect.height > source.height) return;
+        if (v[0] < 0 || v[1] < 0 || rect.width < 64 || rect.height < 64 || rect.x + rect.width > source.width || rect.y + rect.height > source.height) {
+            fg_capture_reject(hash, rect.width < 64 || rect.height < 64 ? "tiny-rect" : "size", NULL, fg_depth, source); return;
+        }
         id<MTLTexture> copy = fg_scene_ring[frame % 3];
         if (!copy || copy.width != rect.width || copy.height != rect.height || copy.pixelFormat != source.pixelFormat) {
             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat width:rect.width height:rect.height mipmapped:NO];
             d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead;
             copy = [dev newTextureWithDescriptor:d]; fg_scene_ring[frame % 3] = copy;
         }
-        if (!copy) return;
+        if (!copy) { fg_capture_reject(hash, "copyfailed", NULL, fg_depth, source); return; }
         end_pass("frame-generation-scene");
         id<MTLBlitCommandEncoder> blit = [cmdbuf blitCommandEncoder];
         [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(rect.x, rect.y, 0) sourceSize:MTLSizeMake(rect.width, rect.height, 1)
@@ -5338,6 +5380,7 @@ static void exec_list(uint64_t handle, int depth) {
 // views, snapshots, bound state - so the next boot can't hit a stale entry. Metal's own shader cache stays warm.
 void renderer_reset(void) {
     fg_camera_frame = fg_scene_frame = UINT64_MAX;
+    fg_reject_frame[0] = fg_reject_frame[1] = UINT64_MAX;
     fg_depth = fg_scene = fg_active_color = nil; fg_canvas = NULL;
     for (int i = 0; i < 3; i++) fg_scene_ring[i] = nil;
     fg_reset();fg_display_reset();fg_geometry_reset();
