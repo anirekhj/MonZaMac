@@ -34,11 +34,34 @@ static __thread KThread *t_cur;
 #define MAX_HANDLES 4096
 static KObject *handles[MAX_HANDLES];
 
+// Keep optional handle history in memory; normal waits do not perform diagnostic I/O.
+#define HANDLE_TRACE_COUNT 128
+static struct {
+    uint32_t handle, thread;
+    KType type;
+    int refs;
+    uint64_t lr;
+    bool closed;
+} handle_traces[HANDLE_TRACE_COUNT];
+static uint64_t handle_trace_next;
+
+static void handle_trace(bool closed, uint32_t h, const KObject *o) {
+    if (!devlog_on("kernel-wait")) return;
+    unsigned i = handle_trace_next++ % HANDLE_TRACE_COUNT;
+    handle_traces[i].handle = h;
+    handle_traces[i].thread = t_cur ? t_cur->handle : 0;
+    handle_traces[i].type = o->type;
+    handle_traces[i].refs = o->refs;
+    handle_traces[i].lr = t_cur ? t_cur->cpu.x[30] : 0;
+    handle_traces[i].closed = closed;
+}
+
 static uint32_t handle_try_alloc(KObject *o) {
     for (int i = 1; i < MAX_HANDLES; i++) {
         if (!handles[i]) {
             handles[i] = o;
             o->refs++;
+            handle_trace(false, 0x100 + i, o);
             return 0x100 + i;
         }
     }
@@ -79,7 +102,9 @@ static void handle_close(uint32_t h) {
     KObject *o = handle_get(h);
     if (!o || h == PSEUDO_THREAD || h == PSEUDO_PROCESS) return;
     handles[h - 0x100] = NULL;
-    if (--o->refs == 0 && (o->type == KOBJ_SESSION_CLIENT || o->type == KOBJ_SESSION_SERVER))
+    --o->refs;
+    handle_trace(true, h, o);
+    if (o->refs == 0 && (o->type == KOBJ_SESSION_CLIENT || o->type == KOBJ_SESSION_SERVER))
         session_handle_closed(o);
 }
 
@@ -684,8 +709,26 @@ static uint32_t wait_synchronization_locked(uint64_t handles_ptr, int32_t count,
     }
     for (;;) {
         for (int i = 0; i < count; i++) {
-            KObject *o = handle_get(hs[i]);
-            if (!o || (expected && o != expected[i])) { r = R_INVALID_HANDLE; goto out; }
+            uint32_t h = hs[i];
+            KObject *o = handle_get(h);
+            if (!o || (expected && o != expected[i])) {
+                if (devlog_on("kernel-wait")) {
+                    devlog("kernel-wait", "invalid wait slot=%d handle=%#x count=%d timeout=%lld reason=%s thread=%#x handles_ptr=%#llx guest_sp=%#llx guest_lr=%#llx",
+                           i, h, count, (long long)timeout, o ? "replaced-object" : "missing-handle",
+                           t ? t->handle : 0, (unsigned long long)handles_ptr,
+                           (unsigned long long)(t ? t->cpu.sp : 0), (unsigned long long)(t ? t->cpu.x[30] : 0));
+                    uint64_t first = handle_trace_next > HANDLE_TRACE_COUNT ? handle_trace_next - HANDLE_TRACE_COUNT : 0;
+                    for (uint64_t j = first; j < handle_trace_next; j++) {
+                        unsigned k = j % HANDLE_TRACE_COUNT;
+                        if (handle_traces[k].handle != h) continue;
+                        devlog("kernel-wait", "handle %s value=%#x type=%u refs=%d thread=%#x guest_lr=%#llx history=%llu",
+                               handle_traces[k].closed ? "close" : "allocate", h, (unsigned)handle_traces[k].type,
+                               handle_traces[k].refs, handle_traces[k].thread, (unsigned long long)handle_traces[k].lr,
+                               (unsigned long long)j);
+                    }
+                }
+                r = R_INVALID_HANDLE; goto out;
+            }
             if (o->signaled) { *index = i; r = R_OK; goto out; }
         }
         if (t->cancel) { t->cancel = false; r = R_CANCELLED; goto out; }
@@ -1340,6 +1383,7 @@ void kernel_reset(void) {
     }
     current_process = (KObject){.type = KOBJ_PROCESS};
     memset(handles, 0, sizeof handles);
+    handle_trace_next = 0;
     nregions = 0;
     heap_size = 0;
     tls_next = TLS_BASE;

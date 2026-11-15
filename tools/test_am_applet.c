@@ -14,6 +14,8 @@ Settings g_settings;
 const uint8_t g_user_id[16] = {0};
 volatile int g_rt_unwind;
 static unsigned style_notifications;
+bool devlog_on(const char *subject) { (void)subject; return false; }
+void devlog(const char *subject, const char *fmt, ...) { (void)subject; (void)fmt; }
 void input_style_changed(void) { style_notifications++; }
 const char *settings_language(void) { return "en-US"; }
 const char *plat_symbol(uint64_t pc, uint64_t *off) { (void)pc; (void)off; return NULL; }

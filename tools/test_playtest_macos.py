@@ -110,7 +110,7 @@ fi
     diagnostics = list((profile/'logs').glob('play-*-framegen.txt'))
     assert len(diagnostics) == 1
     assert diagnostics[0].read_text() == 'framegen/motion mock diagnostic\n'
-    assert 'LARECOMP_DEVLOG=framegen,motion\n' in log
+    assert 'LARECOMP_DEVLOG=framegen,motion,kernel-wait\n' in log
     assert f'LARECOMP_DEVLOG_FILE={diagnostics[0].resolve()}\n' in log
     assert f'Frame generation and motion diagnostics: {diagnostics[0].resolve()}' in first.stdout
     assert 'MTL_' not in log and 'LARECOMP_INPUT=' not in log and 'LARECOMP_SAVE_DIR=' not in log
