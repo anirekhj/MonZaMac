@@ -9,6 +9,7 @@ BUILD="$REPO/build/native-enhancements"
 SOURCE="$HOME/Library/Application Support/com.monzamac.app"
 PROFILE="$REPO/build/playtest-profile"
 NO_SHADER_WARM=0
+NO_PIPELINE_ARCHIVE=0
 RESET_PIPELINE_CACHE=0
 STAGE=""
 WORK=""
@@ -27,6 +28,7 @@ Usage: tools/playtest_macos.sh [options]
   --reset-pipeline-cache
                         Back up the test profile's active native archive this run
   --no-shader-warm      Skip existing startup shader-cache warmup for this run
+  --no-pipeline-archive Bypass the native pipeline archive without changing caches
   -h, --help            Show this help without copying or launching anything
 Save and quit every MonZaMac instance before launching. First use copies saves,
 settings, mods, cache and fonts; the imported pipeline archive is kept as an
@@ -45,6 +47,7 @@ while [[ $# -gt 0 ]]; do
             shift 2;;
         --reset-pipeline-cache) RESET_PIPELINE_CACHE=1; shift;;
         --no-shader-warm) NO_SHADER_WARM=1; shift;;
+        --no-pipeline-archive) NO_PIPELINE_ARCHIVE=1; shift;;
         -h|--help) usage; exit 0;;
         *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2;;
     esac
@@ -129,6 +132,7 @@ GAME_LIB="$BUILD/lasgame.dylib"
 ASSETS="$SOURCE/extracted"
 EXTRA_ENV=()
 if [[ "$NO_SHADER_WARM" == 1 ]]; then EXTRA_ENV+=(LARECOMP_NO_SHADER_WARM=1); fi
+if [[ "$NO_PIPELINE_ARCHIVE" == 1 ]]; then EXTRA_ENV+=(LARECOMP_NO_PIPELINE_ARCHIVE=1); fi
 
 printf 'MonZaMac — isolated local playtest\n\n'
 printf 'Before continuing: SAVE in your installed app, then QUIT it completely.\n'
@@ -184,7 +188,7 @@ else
     require_private_tree "$STAGE"
     # Native archives can take minutes to parse and may belong to another runtime/device.
     # Retain the imported bytes without making that archive active in this build.
-    for archive in pipelines.bin pipelines.saving pipelines.crashed; do
+    for archive in pipelines.bin pipelines.saving pipelines.crashed pipelines.loading; do
         if [[ -e "$STAGE/cache/$archive" ]]; then
             /bin/mkdir -p -- "$STAGE/cache-backups/imported"
             /bin/mv -- "$STAGE/cache/$archive" "$STAGE/cache-backups/imported/$archive"
@@ -218,7 +222,7 @@ require_private_tree "$PROFILE"
 if [[ "$RESET_PIPELINE_CACHE" == 1 ]]; then
     require_stopped
     BACKUP=""
-    for archive in pipelines.bin pipelines.saving pipelines.crashed; do
+    for archive in pipelines.bin pipelines.saving pipelines.crashed pipelines.loading; do
         if [[ -e "$PROFILE/cache/$archive" ]]; then
             if [[ -z "$BACKUP" ]]; then
                 BACKUP="$PROFILE/cache-backups/reset-$(/bin/date '+%Y%m%d-%H%M%S')-$$"
@@ -243,6 +247,7 @@ require_stopped
 
 printf '\nChoose your copied save on the start screen, then Continue (offline).\n'
 if [[ "$NO_SHADER_WARM" == 1 ]]; then printf 'Startup shader warmup skipped for this run; first-use shaders can hitch.\n'; fi
+if [[ "$NO_PIPELINE_ARCHIVE" == 1 ]]; then printf 'Native pipeline archive bypassed for this run; existing cache files are kept.\n'; fi
 printf 'F1: settings/menu.  F3: FPS and resolution (Fn+F1/F3 if needed).\n'
 printf 'Use the same scene and settings for comparison; first-time shaders may still hitch.\n'
 printf 'Save and quit the test normally when finished. Test progress stays in the test profile.\n'

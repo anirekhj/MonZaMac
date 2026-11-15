@@ -19,8 +19,8 @@ profile atomically without replacing an existing directory. Original extracted
 game assets are read from the source profile; saves and settings use the test
 profile. Keep the source profile and its game files available.
 
-The imported `cache/pipelines.bin` and any `pipelines.saving` / `pipelines.crashed`
-markers are preserved under `cache-backups/imported/` in the new profile. They
+The imported `cache/pipelines.bin` and any `pipelines.saving`, `pipelines.crashed`
+or `pipelines.loading` markers are preserved under `cache-backups/imported/` in the new profile. They
 are not made active:
 a large native archive from another app revision/device can spend minutes
 parsing at startup. The test build creates its own archive. Other copied shader
@@ -52,11 +52,22 @@ quit every instance first, then use:
 tools/playtest_macos.sh --reset-pipeline-cache
 ```
 
-This moves only the test profile's active archive and associated saving/crash
+This moves only the test profile's active archive and associated saving/crash/loading
 markers to a unique timestamped `cache-backups/reset-*/` directory and lets the
 runtime create a fresh archive. Marker-only failures are reset too.
 It does not delete archives or reset saves, mods, settings or other shader caches.
 The same process guard and private-profile checks apply.
+
+To bypass the optional native pipeline archive for one run while preserving all
+existing cache files, use:
+
+```sh
+tools/playtest_macos.sh --no-pipeline-archive
+```
+
+This forwards `LARECOMP_NO_PIPELINE_ARCHIVE=1` through the clean launch environment.
+Startup shader warmup and Apple's own caches remain available. It does not move
+or reset the active archive; `--reset-pipeline-cache` remains a separate option.
 
 `--no-shader-warm` explicitly skips the existing startup shader-cache warmup for
 one run. It can shorten that phase but shifts compilation toward first use;

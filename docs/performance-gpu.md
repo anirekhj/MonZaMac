@@ -280,3 +280,31 @@ See [Apple's Metal feature tables](https://developer.apple.com/metal/Metal-Featu
 
 These changes remove repeated setup/allocation work. No in-game FPS improvement is claimed without a matched
 scene replay; native pixel, cache and resource-lifetime checks do not substitute for that measurement.
+## Pipeline archive startup guard
+
+A large optional Metal binary archive can block the first draw inside Apple's archive loader. In a local M3 Max
+sample, the render thread spent more than ten minutes cloning MetalScript descriptors from a 267.8 MiB archive,
+after source-shader warm-up had already completed in 1.65 seconds. The Starting cover was waiting for the first
+present. This is separate from ordinary shader preparation.
+
+The runtime now skips archive files larger than 64 MiB before calling Metal. A bounded, versioned load marker
+records the file identity; an interrupted load of the same file is skipped on the next launch. These are conservative
+guards, not a timeout or cancellation mechanism for Metal. A previously unseen pathological file below the limit
+can still block its first load.
+
+New persistent archive capture stops at 512 pipeline descriptors across render and compute paths. A serialized
+file larger than 64 MiB is not published, preserving the previous committed cache. Normal in-memory pipeline
+caching, shader-source caches and learned recipes remain active. Pipelines outside this persistent hot set use the
+normal compilation path and Metal's own cache; first-use costs may differ after a restart.
+
+For a diagnostic bypass, `tools/playtest_macos.sh --no-pipeline-archive` forwards
+`LARECOMP_NO_PIPELINE_ARCHIVE=1` without resetting caches. `--reset-pipeline-cache` preserves the archive and its
+load/save markers before starting a fresh optional archive. There is no need to delete the whole cache directory.
+
+Validation covers sparse file-size boundaries, load-marker identity and malformed files, marker alias protection,
+both capture paths at the descriptor limit, rendering a new pipeline after capture stops, preserving the previous
+cache after oversized serialization, and a real small-archive hit. The native archive cases run with Metal API
+Validation; archive-hit testing is incompatible with Metal Shader Validation.
+
+Apple describes the separate system pipeline cache and the role of explicit binary archives in
+[Target and optimize GPU binaries with Metal 3](https://developer.apple.com/videos/play/wwdc2022/10102/).

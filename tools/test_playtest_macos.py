@@ -40,6 +40,7 @@ with tempfile.TemporaryDirectory(prefix='monzamac-launcher-mock-') as temporary:
     (source/'cache/pipelines.bin').write_text('original native archive')
     (source/'cache/pipelines.saving').write_text('original saving marker')
     (source/'cache/pipelines.crashed').write_text('original crashed marker')
+    (source/'cache/pipelines.loading').write_text('original loading marker')
     (source/'cache/a').write_text('fake shader data')
     os.link(source/'cache/a', source/'cache/b')
     (home/'external-mod-data').write_text('fake mod data')
@@ -58,12 +59,15 @@ printf 'MOCK GAME; cwd=%s; args=%s\\n' "$PWD" "$*"
 printf 'test-only progress\\n' >> "$LARECOMP_DATA_ROOT/save/progress"
 printf 'framegen/motion mock diagnostic\\n' >> "$LARECOMP_DEVLOG_FILE"
 if [[ -f "$LARECOMP_DATA_ROOT/cache/pipelines.bin" ]]; then echo ACTIVE_ARCHIVE=existing; else echo ACTIVE_ARCHIVE=fresh; fi
-printf 'new test archive' > "$LARECOMP_DATA_ROOT/cache/pipelines.bin"
+if [[ "${LARECOMP_NO_PIPELINE_ARCHIVE:-0}" != 1 ]]; then
+    printf 'new test archive' > "$LARECOMP_DATA_ROOT/cache/pipelines.bin"
+fi
 ''')
     binary.chmod(0o700)
     env = dict(os.environ, HOME=str(home), MTL_DEBUG_LAYER='1', MTL_SHADER_VALIDATION='1',
                LARECOMP_INPUT='must be cleared', LARECOMP_PLAY_SAVE='must be cleared',
-               LARECOMP_SAVE_DIR=str(source/'save'), LARECOMP_NO_SHADER_WARM='1', DYLD_INSERT_LIBRARIES='')
+               LARECOMP_SAVE_DIR=str(source/'save'), LARECOMP_NO_SHADER_WARM='1',
+               LARECOMP_NO_PIPELINE_ARCHIVE='1', DYLD_INSERT_LIBRARIES='')
     def run(*args):
         return subprocess.run(['/bin/bash', str(runscript), *map(str,args)], env=env, input='', text=True, capture_output=True, timeout=30)
     source_before = {str(p.relative_to(source)): (p.read_bytes(), p.stat().st_mtime_ns)
@@ -93,10 +97,11 @@ printf 'new test archive' > "$LARECOMP_DATA_ROOT/cache/pipelines.bin"
     assert f'cwd={workspace.resolve()};' in log or f'cwd={workspace};' in log, log
     assert '--play' not in log
     assert 'ACTIVE_ARCHIVE=fresh' in log
-    for marker in ('pipelines.saving','pipelines.crashed'):
+    for marker in ('pipelines.saving','pipelines.crashed','pipelines.loading'):
         assert not (profile/'cache'/marker).exists()
         assert (profile/'cache-backups/imported'/marker).read_bytes() == (source/'cache'/marker).read_bytes()
     assert 'LARECOMP_NO_SHADER_WARM=' not in log
+    assert 'LARECOMP_NO_PIPELINE_ARCHIVE=' not in log
     assert (profile/'cache-backups/imported/pipelines.bin').read_text() == 'original native archive'
     assert (profile/'cache-backups/imported/pipelines.bin').stat().st_mtime_ns == (source/'cache/pipelines.bin').stat().st_mtime_ns
     assert (profile/'cache/pipelines.bin').read_text() == 'new test archive'
@@ -122,24 +127,43 @@ printf 'new test archive' > "$LARECOMP_DATA_ROOT/cache/pipelines.bin"
     assert len(second_logs) == 1
     assert 'LARECOMP_NO_SHADER_WARM=1\n' in second_logs[0].read_text()
     assert 'ACTIVE_ARCHIVE=existing' in second_logs[0].read_text()
+    assert 'LARECOMP_NO_PIPELINE_ARCHIVE=' not in second_logs[0].read_text()
     assert (profile/'cache-backups/imported/pipelines.bin').read_text() == 'original native archive'
     print('PASS subsequent-run profile preservation, new archive reuse, warmup opt-in and unique retained logs')
+    cache_before_bypass = {str(p.relative_to(profile/'cache')):
+                           (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
+                           for p in (profile/'cache').rglob('*') if p.is_file()}
+    logs_before_bypass = set((profile/'logs').glob('play-*.log'))
+    bypass = run('--no-pipeline-archive')
+    assert bypass.returncode == 0, (bypass.stdout, bypass.stderr)
+    bypass_logs = set((profile/'logs').glob('play-*.log')) - logs_before_bypass
+    assert len(bypass_logs) == 1
+    bypass_log = bypass_logs.pop().read_text()
+    assert 'LARECOMP_NO_PIPELINE_ARCHIVE=1\n' in bypass_log
+    assert 'LARECOMP_NO_SHADER_WARM=' not in bypass_log
+    assert 'ACTIVE_ARCHIVE=existing' in bypass_log
+    assert 'Native pipeline archive bypassed for this run' in bypass.stdout
+    assert cache_before_bypass == {str(p.relative_to(profile/'cache')):
+                                   (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
+                                   for p in (profile/'cache').rglob('*') if p.is_file()}
+    print('PASS explicit archive bypass forwarding preserves cache files and normal shader warmup')
     separate = workspace/'build/custom-playtest'
     custom = run('--build-dir',build,'--source-profile',source,'--profile',separate)
     assert custom.returncode == 0, (custom.stdout,custom.stderr)
     assert (separate/'save/progress').is_file()
     nested = run('--profile',source/'must-not-create')
     assert nested.returncode == 1 and not (source/'must-not-create').exists()
-    assert run('--help').returncode == 0
+    help_result = run('--help')
+    assert help_result.returncode == 0 and '--no-pipeline-archive' in help_result.stdout
     assert run('--unknown').returncode == 2
     assert run('--build-dir').returncode == 2
-    for marker in ('pipelines.saving','pipelines.crashed'):
+    for marker in ('pipelines.saving','pipelines.crashed','pipelines.loading'):
         (profile/'cache'/marker).write_text('test marker')
     reset = run('--reset-pipeline-cache')
     assert reset.returncode == 0, (reset.stdout,reset.stderr)
     backups = list((profile/'cache-backups').glob('reset-*/pipelines.bin'))
     assert len(backups) == 1 and backups[0].read_text() == 'new test archive'
-    for marker in ('pipelines.saving','pipelines.crashed'):
+    for marker in ('pipelines.saving','pipelines.crashed','pipelines.loading'):
         assert not (profile/'cache'/marker).exists()
         assert (backups[0].parent/marker).read_text() == 'test marker'
     assert (source/'cache/pipelines.bin').read_text() == 'original native archive'

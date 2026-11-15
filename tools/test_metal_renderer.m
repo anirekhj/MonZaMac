@@ -5,6 +5,9 @@ static double gpu_interval_union_ms(const double *intervals, size_t count, doubl
 #include "../runtime/nvn/renderer.m"
 #import <ImageIO/ImageIO.h>
 #include <malloc/malloc.h>
+#include <spawn.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 void metal_test_bootstrap(void);
 void metal_test_preparation_page(void);
@@ -2800,6 +2803,189 @@ static void live_shader_pipeline(void) {
     CHECK(!bad,"every live shader replacement must render its new color even when native function addresses are reused");
 }
 
+// Exercise publication limits without asking Metal to compile a huge archive.
+@interface OversizedArchiveFixture : NSObject
+@property(nonatomic) unsigned calls;
+- (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error;
+@end
+@implementation OversizedArchiveFixture
+- (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {
+    (void)error;
+    self.calls++;
+    int fd = open(url.fileSystemRepresentation, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (fd < 0) return NO;
+    bool written = ftruncate(fd, (off_t)PIPELINE_ARCHIVE_MAX_BYTES + 1) == 0;
+    return close(fd) == 0 && written;
+}
+@end
+
+// Archive initialization uses dispatch_once: run startup-policy regressions in
+// an exec'd child so earlier rendering cases cannot preinitialize the archive.
+static void pipeline_archive_isolated(const char *selection) {
+    char executable[4096];
+    CHECK(plat_exe_path(executable, sizeof executable), "archive test executable path");
+    char *const arguments[] = {executable, (char *)selection, NULL};
+    extern char **environ;
+    pid_t child = 0;
+    CHECK(posix_spawn(&child, executable, NULL, NULL, arguments, environ) == 0,
+          "isolated archive regression starts");
+    int status = 0;
+    double began = now_ms();
+    for (;;) {
+        pid_t result = waitpid(child, &status, WNOHANG);
+        if (result == child) break;
+        if (result < 0 && errno == EINTR) continue;
+        CHECK(result == 0, "isolated archive regression can be reaped");
+        if (now_ms() - began >= 60000) {
+            kill(child, SIGKILL);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+            CHECK(false, "archive startup regression exceeded its 60-second deadline");
+        }
+        usleep(10000);
+    }
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "isolated archive regression passes");
+}
+
+static void pipeline_archive_oversized_child(void) {
+    CHECK(!g_archive && !g_archive_read && !g_archive_q, "archive policy is tested before first initialization");
+    unsetenv("LARECOMP_NO_PIPELINE_ARCHIVE");
+    CHECK(mkdir("cache", 0700) == 0, "oversized fixture cache directory");
+    int fd = open("cache/pipelines.bin", O_CREAT | O_EXCL | O_RDWR, 0600);
+    CHECK(fd >= 0, "oversized archive fixture opens");
+    const off_t length = (off_t)PIPELINE_ARCHIVE_MAX_BYTES + 1;
+    const char marker[] = "authored archive guard fixture";
+    CHECK(ftruncate(fd, length) == 0, "oversized archive fixture is sparse");
+    CHECK(pwrite(fd, marker, sizeof marker, 0) == sizeof marker &&
+          pwrite(fd, marker, sizeof marker, length - sizeof marker) == sizeof marker,
+          "oversized fixture has authored boundary markers");
+    struct stat before;
+    CHECK(fstat(fd, &before) == 0 && close(fd) == 0, "oversized fixture identity is recorded");
+    CHECK(pipeline_archive() != nil && g_archive_read == nil,
+          "oversized disk archive is bypassed while a fresh writer remains usable");
+    NvnTexture color = test_texture(1, 4, 4, 1, 1, 0x25, 1);
+    bind_targets(&color, NULL, NULL); prepare_draw(); fullscreen_draw(1);
+    expect_rgba(&color, 0, 255, 0);
+    destroy_texture(&color);
+    // Assert before the harness's final save can legitimately publish a new cache.
+    struct stat after;
+    CHECK(stat("cache/pipelines.bin", &after) == 0 && before.st_dev == after.st_dev &&
+          before.st_ino == after.st_ino && before.st_size == after.st_size,
+          "skipping an oversized archive preserves the original file");
+    fd = open("cache/pipelines.bin", O_RDONLY);
+    char first[sizeof marker], last[sizeof marker];
+    CHECK(fd >= 0 && pread(fd, first, sizeof first, 0) == sizeof first &&
+          pread(fd, last, sizeof last, length - sizeof last) == sizeof last && close(fd) == 0 &&
+          !memcmp(first, marker, sizeof marker) && !memcmp(last, marker, sizeof marker),
+          "cold compilation leaves the oversized fixture bytes intact before saving");
+}
+
+static void pipeline_archive_oversized(void) {
+    pipeline_archive_isolated("pipeline-archive-oversized-child");
+}
+
+static void pipeline_archive_budget_child(void) {
+    CHECK(!g_archive && !g_archive_read && !g_archive_q, "capture budget begins in an isolated process");
+    unsetenv("LARECOMP_NO_PIPELINE_ARCHIVE");
+    CHECK(pipeline_archive() != nil, "capture budget has a real writable archive");
+    NvnTexture color = test_texture(1, 4, 4, 1, 1, 0x25, 1);
+    bind_targets(&color, NULL, NULL); prepare_draw(); fullscreen_draw(1);
+    expect_rgba(&color, 0, 255, 0);
+    renderer_save_pipeline_archive();  // Drain pending additions before borrowing a valid descriptor.
+    NSError *error = nil;
+    id<MTLLibrary> library = [dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void archive_budget_fixture(device uint *out [[buffer(0)]]) { out[0] = 1; }"
+        options:nil error:&error];
+    CHECK(library != nil, "authored archive-budget compute library compiles");
+    MTLComputePipelineDescriptor *compute = [MTLComputePipelineDescriptor new];
+    compute.computeFunction = [library newFunctionWithName:@"archive_budget_fixture"];
+    CHECK(compute.computeFunction != nil, "archive-budget compute function exists");
+    __block NSMutableArray *saved = nil, *fresh = nil;
+    __block MTLRenderPipelineDescriptor *render = nil;
+    __block int dirty = 0;
+    __block bool full = false;
+    dispatch_sync(g_archive_q, ^{
+        saved = g_archive_saved; fresh = g_archive_new; dirty = g_archive_dirty; full = g_archive_capture_full;
+        for (id descriptor in saved) if ([descriptor isKindOfClass:MTLRenderPipelineDescriptor.class]) { render = descriptor; break; }
+    });
+    CHECK(render != nil && dirty == 0, "a real rendered descriptor is available after saving");
+    Prog *program = [Prog new];
+    program->fi = calloc(1, sizeof *program->fi);
+    CHECK(program->fi != NULL, "authored archive-budget metadata allocates");
+    program->fi->out_mask = 1;
+    CHECK(pipeline_archivable(render, program), "render addition reaches the actual archive budget guard");
+    dispatch_sync(g_archive_q, ^{
+        g_archive_saved = [NSMutableArray new]; g_archive_new = [NSMutableArray new];
+        for (unsigned i = 0; i < PIPELINE_ARCHIVE_MAX_DESCRIPTORS; i++) [g_archive_saved addObject:render];
+        g_archive_dirty = 0; g_archive_capture_full = false;
+    });
+    pipeline_archive_add([render copy], program);
+    cs_archive_add(compute);
+    __block bool rejected = false;
+    dispatch_sync(g_archive_q, ^{
+        rejected = g_archive_saved.count == PIPELINE_ARCHIVE_MAX_DESCRIPTORS && !g_archive_new.count &&
+                   g_archive_dirty == 0 && g_archive_capture_full;
+        // Restore real descriptors before an assertion/atexit save can observe
+        // the synthetic set, but retain the full flag for the cold-pipeline draw.
+        g_archive_saved = saved; g_archive_new = fresh; g_archive_dirty = dirty;
+        g_archive_capture_full = rejected ? true : full;
+    });
+    CHECK(rejected, "both actual render and compute additions stop at the persistence descriptor budget");
+    g_pipeline_gen++; memset(pipe_tab, 0, sizeof pipe_tab);  // Force one fresh PSO while persistence is full.
+    fullscreen_draw(1); expect_rgba(&color, 0, 255, 0);
+    __block bool still_full = false;
+    dispatch_sync(g_archive_q, ^{
+        still_full = g_archive_capture_full && g_archive_dirty == dirty &&
+                     g_archive_saved == saved && g_archive_new == fresh && !g_archive_new.count;
+        g_archive_capture_full = full;
+    });
+    CHECK(still_full, "cold pipeline creation and correct rendering continue without further archive capture");
+    destroy_texture(&color);
+}
+
+static void pipeline_archive_budget(void) {
+    pipeline_archive_isolated("pipeline-archive-budget-child");
+}
+
+static void pipeline_archive_publish_child(void) {
+    CHECK(!g_archive && !g_archive_read && !g_archive_q, "publication budget begins in an isolated process");
+    unsetenv("LARECOMP_NO_PIPELINE_ARCHIVE");
+    CHECK(pipeline_archive() != nil, "publication budget initializes a real archive");
+    const char marker[] = "authored committed archive sentinel";
+    int fd = open(g_archive_url.fileSystemRepresentation, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    CHECK(fd >= 0 && write(fd, marker, sizeof marker) == sizeof marker && close(fd) == 0,
+          "previous committed archive fixture is written");
+    struct stat before, after;
+    CHECK(stat(g_archive_url.fileSystemRepresentation, &before) == 0, "previous archive identity is recorded");
+    OversizedArchiveFixture *fixture = [OversizedArchiveFixture new];
+    __block bool rejected = false;
+    dispatch_sync(g_archive_q, ^{
+        id<MTLBinaryArchive> archive = g_archive;
+        NSMutableArray *saved = g_archive_saved, *fresh = g_archive_new;
+        int dirty = g_archive_dirty; bool full = g_archive_capture_full;
+        g_archive = (id<MTLBinaryArchive>)fixture;
+        g_archive_new = [NSMutableArray arrayWithObject:@"authored pending descriptor"];
+        g_archive_dirty = 1; g_archive_capture_full = false;
+        pipeline_archive_save();
+        rejected = g_archive_dirty == 0 && g_archive_capture_full && !g_archive_new.count;
+        g_archive = archive; g_archive_saved = saved; g_archive_new = fresh;
+        g_archive_dirty = dirty; g_archive_capture_full = full;
+    });
+    CHECK(fixture.calls == 1 && rejected, "an oversized serialization stops further capture and clears dirty state");
+    CHECK(stat(g_archive_url.fileSystemRepresentation, &after) == 0 && before.st_dev == after.st_dev &&
+          before.st_ino == after.st_ino && before.st_size == after.st_size,
+          "an oversized temporary archive never replaces the committed cache");
+    fd = open(g_archive_url.fileSystemRepresentation, O_RDONLY);
+    char actual[sizeof marker];
+    CHECK(fd >= 0 && read(fd, actual, sizeof actual) == sizeof actual && close(fd) == 0 &&
+          !memcmp(marker, actual, sizeof marker), "the previous committed archive contents remain intact");
+    CHECK(access("cache/pipelines.bin.tmp", F_OK) != 0 && access("cache/pipelines.saving", F_OK) != 0,
+          "oversized publication removes its temporary output and save marker");
+}
+
+static void pipeline_archive_publish(void) {
+    pipeline_archive_isolated("pipeline-archive-publish-child");
+}
+
 static void pipeline_archive_reload(void) {  // a pipeline built once is found in cache/pipelines.bin on the next run
     if (!pipeline_archive()) { fprintf(stderr, "pipeline archive off (LARECOMP_NO_PIPELINE_ARCHIVE)\n"); return; }
     NvnTexture color = test_texture(1, 4, 4, 1, 1, 0x25, 1);
@@ -2962,6 +3148,9 @@ static const struct { const char *name, *group; TestFn run; bool needs_sampler26
     {"early-snapshot", "early", shader_early_snapshot},
     {"program-readiness", "sibling", program_readiness},
     {"pipeline-archive", "sibling", pipeline_archive_reload},
+    {"pipeline-archive-oversized", "archive-safety", pipeline_archive_oversized},
+    {"pipeline-archive-budget", "archive-safety", pipeline_archive_budget},
+    {"pipeline-archive-publish", "archive-safety", pipeline_archive_publish},
     {"shadow-fallback", "sibling", shadow_fallback},
     {"safe-math-graphics", "sibling", safe_math_graphics},
     {"safe-math-compute", "sibling", safe_math_compute},
@@ -3040,6 +3229,10 @@ int metal_renderer_test_main(int argc, char **argv) { @autoreleasepool {
     if (!dev) { fprintf(stderr, "SKIP: no Metal device\n"); return 77; }
     const char *selection = argc > 1 ? argv[1] : "all";
     unsigned ran = 0, skipped = 0;
+    TestFn isolated = !strcmp(selection, "pipeline-archive-oversized-child") ? pipeline_archive_oversized_child :
+        !strcmp(selection, "pipeline-archive-budget-child") ? pipeline_archive_budget_child :
+        !strcmp(selection, "pipeline-archive-publish-child") ? pipeline_archive_publish_child : NULL;
+    if (isolated) { isolated(); check_gpu(); renderer_reset(); ran++; }
     for (unsigned i = 0; i < sizeof tests / sizeof *tests; i++) {
         if (strcmp(selection, "all") && strcmp(selection, tests[i].name) && strcmp(selection, tests[i].group)) continue;
         if (tests[i].needs_sampler26 && !native_sampler_features_available()) {

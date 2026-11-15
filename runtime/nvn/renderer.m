@@ -17,6 +17,7 @@
 
 #include "maxwell/shader.h"
 #include "cache_probe.h"
+#include "pipeline_archive_policy.h"
 #include "shader_trace.h"
 #include "nvn.h"
 #include "renderer.h"
@@ -1836,7 +1837,9 @@ void shader_cache_warm(void) {
 // built at once, so its draws are not skipped while it compiles. The archive read from the file is only looked up;
 // this run's pipelines (hits included) go into a new one, written on a background queue, which then replaces the file
 // (on the Mac, saving an archive loaded from a file failed with "Invalid URL").
-// LARECOMP_NO_PIPELINE_ARCHIVE=1 turns it off (A/B); delete cache/ to reset it.
+// LARECOMP_NO_PIPELINE_ARCHIVE=1 turns this optional archive off; Metal's own cache still applies.
+// Large archives can spend minutes cloning MetalScript descriptors before the first frame. Bound both the file
+// loaded and this run's persisted descriptor set; the in-memory pipeline cache is independent of these budgets.
 // Metal's serializeToURL: has crashed inside Metal (EXC_BAD_ACCESS, no error returned) on some Macs. A save leaves
 // cache/pipelines.saving while it runs; finding it at the next start means that save killed the game, so the archive
 // stays off from then on (cache/pipelines.crashed), instead of crashing every session.
@@ -1847,6 +1850,19 @@ static int g_archive_dirty;  // pipelines added since the last save (on g_archiv
 static NSMutableArray<id> *g_archive_saved, *g_archive_new;  // render and compute descriptors  // in the last save / since (on g_archive_q)
 static int g_archive_hits;   // pipelines found in the archive this run (render thread)
 static NSURL *g_archive_url; // absolute, fixed at open: the working directory may be gone at exit (the tests delete it)
+static NSURL *g_archive_loading_url;
+static bool g_archive_capture_full;  // persistent-cache budget reached (on g_archive_q)
+
+static bool pipeline_archive_accept_more(void) {  // on g_archive_q
+    if (g_archive_capture_full) return false;
+    if (!archive_descriptor_budget_available((uint64_t)g_archive_saved.count + g_archive_new.count)) {
+        g_archive_capture_full = true;
+        LOG("[shader] pipeline archive capture limited to %u descriptors; normal pipeline compilation continues\n",
+            (unsigned)PIPELINE_ARCHIVE_MAX_DESCRIPTORS);
+        return false;
+    }
+    return true;
+}
 
 // A failed save leaves the archive empty ("Nothing to serialize"): build it again from the pipelines given
 static BOOL pipeline_archive_add_desc(id pd, NSError **err) {  // on g_archive_q
@@ -1902,11 +1918,25 @@ static void pipeline_archive_save(void) {  // on g_archive_q
             return;
         }
     }
+    struct stat saved;
+    if (lstat(tmp.fileSystemRepresentation, &saved) != 0 || !S_ISREG(saved.st_mode) || saved.st_size <= 0 ||
+        (uint64_t)saved.st_size > PIPELINE_ARCHIVE_MAX_BYTES) {
+        // Keep the last atomically committed cache. A large temporary archive must never become the next startup's input.
+        LOG("[shader] pipeline archive exceeds the persistence budget or could not be validated; keeping previous cache\n");
+        unlink(tmp.fileSystemRepresentation);
+        unlink("cache/pipelines.saving");
+        g_archive_capture_full = true;
+        g_archive_dirty = 0;
+        [g_archive_new removeAllObjects];
+        return;
+    }
     unlink("cache/pipelines.saving");
     if (rename(tmp.fileSystemRepresentation, g_archive_url.fileSystemRepresentation) != 0) {
         LOG("[shader] pipeline archive save failed: %s\n", strerror(errno));
         return;
     }
+    // A newly committed, bounded archive replaces the input associated with any interrupted load marker.
+    unlink(g_archive_loading_url.fileSystemRepresentation);
     [g_archive_saved addObjectsFromArray:g_archive_new];
     [g_archive_new removeAllObjects];
     // A serialized archive is not added to or saved again: Metal crashed on the next save of the same one (issue 101;
@@ -1936,14 +1966,31 @@ static id<MTLBinaryArchive> pipeline_archive(void) {
         }
         if (access("cache/pipelines.crashed", F_OK) == 0) return;
         g_archive_url = [NSURL fileURLWithPath:@"cache/pipelines.bin"].absoluteURL;
+        g_archive_loading_url = [NSURL fileURLWithPath:@"cache/pipelines.loading"].absoluteURL;
         MTLBinaryArchiveDescriptor *ad = [MTLBinaryArchiveDescriptor new];
-        NSError *err;
-        if (access(g_archive_url.fileSystemRepresentation, R_OK) == 0) {
-            ad.url = g_archive_url;
-            g_archive_read = [dev newBinaryArchiveWithDescriptor:ad error:&err];
-            // made by another OS / GPU, or damaged: this run writes a new one
-            if (!g_archive_read) LOG("[shader] pipeline archive not usable (%s), starting over\n", err.localizedDescription.UTF8String);
-            ad.url = nil;
+        NSError *err = nil;
+        uint64_t archive_bytes = 0;
+        enum ArchiveLoadDecision decision = archive_load_decision(g_archive_url.fileSystemRepresentation,
+            g_archive_loading_url.fileSystemRepresentation, &archive_bytes);
+        if (decision == ARCHIVE_LOAD_READY) {
+            if (archive_mark_loading(g_archive_url.fileSystemRepresentation, g_archive_loading_url.fileSystemRepresentation)) {
+                double load_started = now_ms();
+                LOG("[shader] loading pipeline archive (%llu bytes)\n", (unsigned long long)archive_bytes);
+                ad.url = g_archive_url;
+                g_archive_read = [dev newBinaryArchiveWithDescriptor:ad error:&err];
+                unlink(g_archive_loading_url.fileSystemRepresentation);
+                LOG("[shader] pipeline archive load completed in %.0f ms\n", now_ms() - load_started);
+                // made by another OS / GPU, or damaged: this run writes a new one
+                if (!g_archive_read) LOG("[shader] pipeline archive not usable (%s), starting over\n", err.localizedDescription.UTF8String);
+                ad.url = nil;
+            } else LOG("[shader] could not guard pipeline archive load; using normal compilation\n");
+        } else if (decision == ARCHIVE_LOAD_OVERSIZED) {
+            LOG("[shader] pipeline archive skipped (%llu bytes exceeds %llu-byte startup budget); using normal compilation\n",
+                (unsigned long long)archive_bytes, (unsigned long long)PIPELINE_ARCHIVE_MAX_BYTES);
+        } else if (decision == ARCHIVE_LOAD_INTERRUPTED) {
+            LOG("[shader] previous pipeline archive load was interrupted; using normal compilation\n");
+        } else if (decision == ARCHIVE_LOAD_INVALID) {
+            LOG("[shader] pipeline archive metadata is invalid; using normal compilation\n");
         }
         g_archive = [dev newBinaryArchiveWithDescriptor:ad error:&err];
         if (!g_archive) { g_archive_read = nil; LOG("[shader] no pipeline archive: %s\n", err.localizedDescription.UTF8String); return; }
@@ -1976,6 +2023,7 @@ static bool pipeline_archivable(MTLRenderPipelineDescriptor *pd, Prog *pr) {
 static void pipeline_archive_add(MTLRenderPipelineDescriptor *pd, Prog *pr) {
     if (!g_archive || !pipeline_archivable(pd, pr)) return;
     dispatch_async(g_archive_q, ^{
+        if (!pipeline_archive_accept_more()) return;
         NSError *err;
         pd.binaryArchives = nil;  // (our own copy) built from its functions alone
         if (![g_archive addRenderPipelineFunctionsWithDescriptor:pd error:&err]) {
@@ -2117,6 +2165,7 @@ static bool cs_translate(CsProg *cp, const NvnShaderStage *ss, const ShaderKey *
 static void cs_archive_add(MTLComputePipelineDescriptor *cd) {
     if (!g_archive) return;
     dispatch_async(g_archive_q, ^{
+        if (!pipeline_archive_accept_more()) return;
         NSError *err;
         cd.binaryArchives = nil;
         if (![g_archive addComputePipelineFunctionsWithDescriptor:cd error:&err]) {
