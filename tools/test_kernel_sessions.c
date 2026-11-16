@@ -15,6 +15,8 @@ void plat_print_backtrace(void) {}
 uint32_t vi_vsync_handle(void) {return 0;}
 int ipc_handle_request(Cpu *c,uint32_t h) {(void)c;KObject *o=handle_get(h);return o&&o->type==KOBJ_SESSION?0x1234:R_INVALID_HANDLE;}
 
+uint64_t g_alias_base, g_alias_size;
+
 static bool diagnostic_enabled;
 static char diagnostic_text[32768];
 static size_t diagnostic_used;
@@ -29,6 +31,24 @@ void devlog(const char *subject,const char *fmt,...) {
 static void clear_diagnostic(void) {diagnostic_used=0;diagnostic_text[0]=0;}
 
 static void close_handle(uint32_t h);
+static void test_guest_reads(void) {
+ size_t page=(size_t)sysconf(_SC_PAGESIZE);
+ unsigned char *memory=mmap(NULL,page*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+ assert(memory!=MAP_FAILED&&!mprotect(memory+page,page,PROT_NONE));
+ g_alias_base=(uintptr_t)memory;g_alias_size=page*2;
+ regions[0]=(Region){.addr=(uintptr_t)memory,.size=page,.type=4,.perm=1};nregions=1;
+ uint64_t source=0x1122334455667788ull,result=0;memcpy(memory,&source,sizeof source);
+ assert(kernel_read_guest(&result,(uintptr_t)memory,sizeof result)&&result==source);
+ assert(!kernel_read_guest(&result,(uintptr_t)memory+page-4,sizeof result));
+ assert(!kernel_read_guest(&result,(uintptr_t)memory+page,sizeof result));
+ assert(!kernel_read_guest(&result,UINT64_MAX-3,sizeof result));
+ assert(!kernel_read_guest(NULL,(uintptr_t)memory,sizeof result));
+ assert(!kernel_read_guest(&result,(uintptr_t)memory,0));
+ regions[0].perm=0;assert(!kernel_read_guest(&result,(uintptr_t)memory,sizeof result));
+ nregions=0;g_alias_base=g_alias_size=0;assert(!munmap(memory,page*2));
+ puts("PASS bounded guest reads reject reserved, protected and cross-region memory");
+}
+
 static void test_wait_diagnostics(void) {
  int32_t index=-1;uint32_t bad=0xdead;
  assert(svc_wait_synchronization((uintptr_t)&bad,1,0,&index)==R_INVALID_HANDLE);
@@ -98,6 +118,7 @@ static void pair(uint32_t *server,uint32_t *client) {assert(session_create(serve
 
 int main(void) {
  uint32_t msg[64]={0};KThread receiver;init_thread(&receiver,msg);t_cur=&receiver;
+ test_guest_reads();
  test_wait_diagnostics();
  uint32_t server,client;pair(&server,&client);Sender a,b;pthread_t ah,bh;int32_t index=-1;
  start_sender(&a,client,17,&ah);await_request(server);start_sender(&b,client,23,&bh);

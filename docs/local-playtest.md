@@ -31,17 +31,21 @@ re-import the source profile. To make a new copy, choose a new `--profile` path.
 Choose the copied save at the start screen, then Continue offline. F1 opens
 settings; F3 shows FPS/resolution (Fn may be needed). Compare the same scene and
 settings after shaders settle. The launcher clears inherited test/Metal validation
-hooks, keeps normal startup shader warmup, and enables the `framegen`, `motion` and `kernel-wait`
-developer-log subjects for this playtest. It prints unique per-run play and diagnostic
+hooks, keeps normal startup shader warmup, and enables the `framegen`, `motion`,
+`kernel-wait` and `gift` developer-log subjects for this playtest. It prints unique per-run play and diagnostic
 log paths under the test profile's `logs/`. The diagnostic filename keeps its
-`-framegen.txt` suffix and contains all three subjects, including native orientation reads and
-handle allocation/close history. Invalid waits include the failing handle, caller
+`-framegen.txt` suffix and contains all four subjects, including native orientation
+reads, local gift claims and handle allocation/close history. Invalid waits include the failing handle, caller
 and recent history for that handle; this records evidence without changing wait results.
 The optional history retains at most 128 allocation/close events in memory and
 writes them only on an invalid wait, avoiding routine diagnostic I/O under the
 kernel lock. No extra guest memory or stack slots are read. A copied setting that already enables
 all developer subjects remains a copied user preference. Keep the terminal open
 while playing, and quit normally when finished. Test saves are not copied back.
+
+The [offline Mystery Gift picker](offline-mystery-gifts.md) is available on the
+supported offline game build. After claiming gifts and leaving the picker, return
+to the normal game menu and press **R: Save Progress** before quitting.
 
 Options can use absolute paths or paths relative to the current directory:
 

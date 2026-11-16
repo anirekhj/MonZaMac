@@ -59,6 +59,9 @@ typedef struct {
 extern pthread_mutex_t g_klock;
 extern KThread *g_waitlist;
 
+// Copy only from a readable mapped guest region. Does not expose reserved holes.
+bool kernel_read_guest(void *out, uint64_t address, size_t size);
+
 KObject *handle_get(uint32_t h);
 uint32_t kernel_new_handle(KObject *o);
 void kernel_signal(KObject *o);  // caller holds g_klock

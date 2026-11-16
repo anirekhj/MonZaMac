@@ -212,7 +212,17 @@ static std::atomic<bool> g_kbd_enter{false};  // Enter pressed: confirmed by the
 static std::atomic<bool> g_last_pad{false};
 static char g_kbd_text[96];
 static int g_kbd_max = 8;
-static bool capturing() { return g_open.load() || g_kbd.load() == 1; }
+struct GiftOption {
+    std::string name, description, status;
+    bool available;
+};
+static pthread_mutex_t gift_lock = PTHREAD_MUTEX_INITIALIZER;
+static std::vector<GiftOption> g_gift_options;
+static std::atomic<bool> g_gift_busy{false}, g_gift_active{false};
+static std::atomic<int> g_gift_result{-1};  // -2 waiting, -1 cancelled, otherwise the selected index
+static int g_gift_selected;
+static bool g_gift_appearing;
+static bool capturing() { return g_open.load() || g_kbd.load() == 1 || g_gift_active.load(); }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up.
 extern "C" bool menu_input_captured(void) { return capturing(); }
 
@@ -230,6 +240,13 @@ bool menu_handle_event(const SDL_Event *e) {
     if (g_open.load() && bind_capture_event(e)) return true;  // Controls tab waiting for a new binding: it takes the press
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
     if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_pad = true;
+    if (g_gift_active.load() &&
+        ((e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_ESCAPE && !e->key.repeat) ||
+         (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && e->gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH))) {
+        int waiting = -2;
+        g_gift_result.compare_exchange_strong(waiting, -1);
+        return true;
+    }
     if (g_kbd.load() == 1 && e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {  // Enter confirms, Esc cancels
         // (not g_kbd = 2 here: the characters typed just before are still queued for the render thread, and the game
         // thread would read the name without them - the last letters of a typed name were lost while frames were slow)
@@ -241,7 +258,7 @@ bool menu_handle_event(const SDL_Event *e) {
         return true;
     }
     // typing (a text field, the on-screen keyboard, the name entry): keys are text, not menu shortcuts
-    bool typing = g_kbd.load() == 1 || (g_open.load() && g_text_busy.load());
+    bool typing = g_gift_active.load() || g_kbd.load() == 1 || (g_open.load() && g_text_busy.load());
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
         if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F1 ||
@@ -1154,6 +1171,11 @@ static void tab_about(void) {
 RT_ON_RESET(menu_reset) {
     set_open(false);
     g_kbd = 0;
+    pthread_mutex_lock(&gift_lock);
+    g_gift_result = -1;
+    g_gift_active = false;
+    g_gift_options.clear();
+    pthread_mutex_unlock(&gift_lock);
     osk_cancel();
     pthread_mutex_lock(&q_lock);
     q_events.clear();
@@ -1229,6 +1251,130 @@ extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, in
     g_kbd = 0;
     input_reset();
     return ok;
+}
+
+// Host-owned copies keep the render thread independent of the caller's catalog lifetime.
+static void mystery_gift_draw(ImGuiIO &io, float scale) {
+    pthread_mutex_lock(&gift_lock);
+    if (!g_gift_active.load() || g_gift_result.load() != -2 || g_gift_options.empty()) {
+        pthread_mutex_unlock(&gift_lock);
+        return;
+    }
+    bool appearing = g_gift_appearing;
+    g_gift_appearing = false;
+    if (appearing) io.ClearInputKeys();  // the press that opened the dialog cannot claim a gift
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 150));
+    float w = fminf(io.DisplaySize.x * 0.94f, 1440 * scale), h = io.DisplaySize.y * 0.86f;
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
+    if (appearing) ImGui::SetNextWindowFocus();
+    ImGui::Begin("##offline-mystery-gifts", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                                    ImGuiWindowFlags_NoSavedSettings);
+    ImGui::PushFont(g_font_big);
+    ImGui::TextColored(ImVec4(0.28f, 0.84f, 1.0f, 1), "%s", ui_tr("Offline Mystery Gifts"));
+    ImGui::PopFont();
+    ImGui::TextDisabled("%s", ui_tr("After claiming, leave this menu and save your progress."));
+    ImGui::Separator();
+    float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetTextLineHeightWithSpacing();
+    float body_h = fmaxf(ImGui::GetContentRegionAvail().y - footer, ImGui::GetFrameHeight());
+    float list_w = ImGui::GetContentRegionAvail().x * 0.44f;
+    if (ImGui::BeginChild("##gifts", ImVec2(list_w, body_h), ImGuiChildFlags_Borders)) {
+        for (int i = 0; i < (int)g_gift_options.size(); i++) {
+            const GiftOption &option = g_gift_options[i];
+            ImGui::PushID(i);
+            if (appearing && i == g_gift_selected) ImGui::SetKeyboardFocusHere();
+            if (ImGui::Selectable(option.name.c_str(), g_gift_selected == i, 0,
+                                  ImVec2(0, ImGui::GetTextLineHeight() + 12 * scale)) || ImGui::IsItemFocused())
+                g_gift_selected = i;
+            if (appearing && i == g_gift_selected) ImGui::SetScrollHereY(0.5f);
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+    const GiftOption &selected = g_gift_options[g_gift_selected];
+    if (ImGui::BeginChild("##gift-details", ImVec2(0, body_h), ImGuiChildFlags_Borders)) {
+        ImGui::PushFont(g_font_big);
+        ImGui::TextWrapped("%s", selected.name.c_str());
+        ImGui::PopFont();
+        ImGui::Spacing();
+        ImGui::TextWrapped("%s", selected.description.c_str());
+        ImGui::Spacing();
+        ImGui::Separator();
+        if (!selected.status.empty()) ImGui::TextWrapped("%s", selected.status.c_str());
+        else ImGui::TextDisabled("%s", ui_tr(selected.available ? "Available" : "Unavailable"));
+    }
+    ImGui::EndChild();
+    ImGui::Spacing();
+    if (ImGui::Button(ui_tr("Back"), ImVec2(180 * scale, 0))) {
+        int waiting = -2;
+        g_gift_result.compare_exchange_strong(waiting, -1);
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!selected.available);
+    if ((ImGui::Button(ui_tr("Claim gift"), ImVec2(220 * scale, 0)) ||
+         ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false)) && selected.available) {
+        int waiting = -2;
+        g_gift_result.compare_exchange_strong(waiting, g_gift_selected);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", ui_tr("+ / Start  claim     B / Esc  back"));
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        int waiting = -2;
+        g_gift_result.compare_exchange_strong(waiting, -1);
+    }
+    ImGui::End();
+    pthread_mutex_unlock(&gift_lock);
+}
+
+// Game thread: wait exactly as name entry does, without competing with the game's render thread.
+extern "C" int menu_mystery_gift_run(const MenuGiftOption *options, int count) {
+    if (!options || count <= 0 || count > 512 || g_rt_unwind || g_open.load() || g_kbd.load() == 1) return -1;
+    bool idle = false;
+    if (!g_gift_busy.compare_exchange_strong(idle, true)) return -1;
+    std::vector<GiftOption> copied;
+    copied.reserve((size_t)count);
+    for (int i = 0; i < count; i++)
+        copied.push_back({options[i].name ? options[i].name : "", options[i].description ? options[i].description : "",
+                          options[i].status ? options[i].status : "", options[i].available});
+    input_reset();
+    pthread_mutex_lock(&q_lock);
+    q_events.clear();
+    pthread_mutex_unlock(&q_lock);
+    pthread_mutex_lock(&gift_lock);
+    g_gift_options = std::move(copied);
+    g_gift_selected = 0;
+    for (int i = 0; i < count; i++) if (g_gift_options[i].available) { g_gift_selected = i; break; }
+    g_gift_appearing = true;
+    g_gift_result = -2;
+    g_gift_active = true;
+    pthread_mutex_unlock(&gift_lock);
+    extern void backend_represent(void);
+    extern uint64_t renderer_present_count(void);
+    uint64_t seen = renderer_present_count(), quiet_since = SDL_GetTicks();
+    while (g_gift_active.load() && g_gift_result.load() == -2 && !g_rt_unwind) {
+        uint64_t t0 = SDL_GetTicks(), presented = renderer_present_count();
+        if (presented != seen) {
+            seen = presented;
+            quiet_since = t0;
+        } else if (t0 - quiet_since >= 250) {
+            backend_represent();
+            seen = renderer_present_count();
+        }
+        uint64_t dt = SDL_GetTicks() - t0;
+        if (dt < 16) SDL_Delay((uint32_t)(16 - dt));
+    }
+    pthread_mutex_lock(&gift_lock);
+    int result = g_rt_unwind ? -1 : g_gift_result.load();
+    if (result < 0 || result >= count || !g_gift_options[result].available) result = -1;
+    g_gift_active = false;
+    g_gift_result = -1;
+    g_gift_options.clear();
+    pthread_mutex_unlock(&gift_lock);
+    input_reset();
+    g_gift_busy = false;
+    return result;
 }
 
 // The tab bar and its pages, into the current window: the in-game menu, and the start screen's Settings (in_game
@@ -1374,7 +1520,8 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #endif
     bool open = g_open.load();
     bool kbd = g_kbd.load() == 1;
-    if (!open && !kbd && !g_settings.show_fps && !g_stats.load()) {
+    bool gift = g_gift_active.load();
+    if (!open && !kbd && !gift && !g_settings.show_fps && !g_stats.load()) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -1545,6 +1692,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
 
     if (kbd) keyboard_draw(io, scale);
+    if (gift) mystery_gift_draw(io, scale);
     ImGui::Render();
     g_text_busy = open && ui_text_busy();
 #ifdef __APPLE__

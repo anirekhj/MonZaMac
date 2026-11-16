@@ -21,6 +21,15 @@ int menu_catalog_status(void);
 void menu_catalog_update(void);
 #endif
 
+// Game thread: local gift selection. Strings are copied for the dialog; returns an option index or -1 on cancel.
+typedef struct MenuGiftOption {
+    const char *name;
+    const char *description;
+    const char *status;
+    bool available;
+} MenuGiftOption;
+int menu_mystery_gift_run(const MenuGiftOption *options, int count);
+
 // Main (UI) thread: returns true if the event was consumed by the menu (the game must not see it).
 bool menu_handle_event(const SDL_Event *e);
 bool menu_is_open(void);

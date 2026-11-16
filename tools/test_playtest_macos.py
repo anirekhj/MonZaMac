@@ -57,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix='monzamac-launcher-mock-') as temporary:
 printf 'MOCK GAME; cwd=%s; args=%s\\n' "$PWD" "$*"
 /usr/bin/env | /usr/bin/sort
 printf 'test-only progress\\n' >> "$LARECOMP_DATA_ROOT/save/progress"
-printf 'framegen/motion mock diagnostic\\n' >> "$LARECOMP_DEVLOG_FILE"
+printf 'framegen/motion/gift/wait mock diagnostic\\n' >> "$LARECOMP_DEVLOG_FILE"
 if [[ -f "$LARECOMP_DATA_ROOT/cache/pipelines.bin" ]]; then echo ACTIVE_ARCHIVE=existing; else echo ACTIVE_ARCHIVE=fresh; fi
 if [[ "${LARECOMP_NO_PIPELINE_ARCHIVE:-0}" != 1 ]]; then
     printf 'new test archive' > "$LARECOMP_DATA_ROOT/cache/pipelines.bin"
@@ -109,10 +109,10 @@ fi
     assert f'LARECOMP_GAME_LIB={build.resolve()}/lasgame.dylib\n' in log
     diagnostics = list((profile/'logs').glob('play-*-framegen.txt'))
     assert len(diagnostics) == 1
-    assert diagnostics[0].read_text() == 'framegen/motion mock diagnostic\n'
-    assert 'LARECOMP_DEVLOG=framegen,motion,kernel-wait\n' in log
+    assert diagnostics[0].read_text() == 'framegen/motion/gift/wait mock diagnostic\n'
+    assert 'LARECOMP_DEVLOG=framegen,motion,kernel-wait,gift\n' in log
     assert f'LARECOMP_DEVLOG_FILE={diagnostics[0].resolve()}\n' in log
-    assert f'Frame generation and motion diagnostics: {diagnostics[0].resolve()}' in first.stdout
+    assert f'Frame generation, motion, gift and wait diagnostics: {diagnostics[0].resolve()}' in first.stdout
     assert 'MTL_' not in log and 'LARECOMP_INPUT=' not in log and 'LARECOMP_SAVE_DIR=' not in log
     assert 'LARECOMP_PLAY_SAVE=' not in log and 'DYLD_INSERT_LIBRARIES=' not in log
     print('PASS first-run staging, private dereferenced copies, timestamps, source unchanged, clean environment, assets/cwd and logs')

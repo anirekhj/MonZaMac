@@ -138,6 +138,13 @@ HLE_FUNC("_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE"
     c->x[0] = 0;  // ResultSuccess
 }
 
+// Local gift receipts use the SDK's network-clock API for their date stamp. The
+// runtime's clocks share the host epoch; this read never opens a connection.
+HLE_FUNC("_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", time_std_network_now) {
+    if (c->x[0]) *(int64_t *)(uintptr_t)c->x[0] = unix_now();
+    c->x[0] = 0;
+}
+
 // std::chrono::system_clock::now() (the SDK's libc++: microseconds since 1970): the host clock. The SDK's own path read
 // the realtime clock as ~0 here, and Pokémon Z-A stamps each donut with it in milliseconds (game fn 0x7002d564d8): a
 // donut stamped 0 reads as an empty slot (the pocket adds into the first slot whose stamp is 0, fn 0x7002ad5874), so

@@ -151,6 +151,7 @@ static void boot(const char *root) {
     { extern void settings_load(void); settings_load(); }
     kernel_init();
     dispatch_init();
+    { extern void offline_gifts_install(void); offline_gifts_install(); }
 
     uint32_t stack_size = 0x100000;
     int prio = 44;

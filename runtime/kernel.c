@@ -160,6 +160,23 @@ static int nregions;
 static uint64_t heap_size;
 static uint64_t tls_next = TLS_BASE;
 uint64_t kernel_heap_size(void) { return heap_size; }  // bytes from HEAP_BASE set by SetHeapSize
+
+bool kernel_read_guest(void *out, uint64_t address, size_t size) {
+    if (!out || !size || !guest_contains(address, size)) return false;
+    bool valid = false;
+    pthread_mutex_lock(&g_klock);
+    for (int i = 0; i < nregions; i++) {
+        Region *r = &regions[i];
+        if ((r->perm & 1) && address >= r->addr && address - r->addr < r->size && size <= r->size - (address - r->addr)) {
+            memcpy(out, (const void *)(uintptr_t)address, size);
+            valid = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_klock);
+    return valid;
+}
+
 // The largest physical memory region (svcMapPhysicalMemory): where a game on the SDK's virtual address memory keeps
 // what others keep in their heap. Its size (0: none), *addr its start.
 uint64_t kernel_phys_largest(uint64_t *addr) {
